@@ -8,7 +8,7 @@ All options in version **1.3** have been tested in-game and confirmed working wi
 ## How to Use
 
 1. Launch the game and load your save.
-2. Open [OoT_Remake_Plus_Mega_Trainer.ct](OoT_Remake_Plus_Mega_Trainer.ct) in Cheat Engine and attach it to the right process.
+2. Open [OoT_Remake_Mega_Trainer.ct](OoT_Remake_Mega_Trainer.ct) in Cheat Engine and attach it to the right process.
 3. Check **ENABLE** or press **Numpad 0**. Wait for detection to finish before enabling any other options. The table scans for addresses specific to the current session.
 
 ## Infinite Options
