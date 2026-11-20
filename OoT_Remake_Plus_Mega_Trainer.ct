@@ -1,0 +1,2926 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="52">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>0</ID>
+      <Description>"ENABLE (Can take a few seconds, BE PATIENT - NUMPAD 0)"</Description>
+      <Options moHideChildren="1"/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+-- Int records are 0x28 bytes apart. Match their metadata and skip the values.
+-- The two neighboring values used by the old signature change during play.
+local RUPEE_RECORD_PATTERN=table.concat({
+  '00 00 00 00 08 00 00 00 01 00 00 00',
+  '00 00 00 00 00 00 00 00 0C 00 00 00 ?? ?? ?? ?? ?? ?? ?? ?? 00 00 00 00 ?? ?? ?? ??',
+  '00 00 00 00 08 00 00 00 01 00 00 00',
+  '00 00 00 00 00 00 00 00 0C 00 00 00 ?? ?? ?? ?? ?? ?? ?? ?? 00 00 00 00 ?? ?? ?? ??',
+  '00 00 00 00 08 00 00 00 01 00 00 00',
+}, ' ')
+local RUPEE_LEGACY_PATTERN='00 00 00 00 0C 00 00 00 0C 00 00 00 0C 00 00 00 00 00 00 00 ?? ?? ?? ?? 00 00 00 00 08 00 00 00'
+-- The live current/max health records have their 32-bit GameData hashes
+-- immediately after the values. The records are spaced 0x10 bytes apart.
+local HEART_RECORD_PATTERN='80 55 AB 31 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? A1 1D E0 FB'
+local MAGIC_RECORD_PATTERN='00 82 B1 76 97 3A D6 12 49 33 FA 3A'
+local HEART_LEGACY_PATTERN='?? ?? 00 00 02 00 00 00 01 00 00 00 ?? ?? 00 00 02 00 00 00 01 00 00 00'
+local RS={'OoT_Rupees_A','OoT_Wallet_A'}
+local inventorySymbols={'OoT_Inventory_A','OoT_MajoraStock_A','OoT_BottleContent_1530','OoT_BottleContent_1531','OoT_BottleContent_1532','OoT_BottleContent_1533','OoT_BottleContent_1534'}
+local HS={'OoT_Hearts_A','OoT_MaxHearts_A'}
+local MS={'OoT_ActiveMagic_A'}
+local function log(s) print(s) end
+local function cleanup()
+  if _G.OoT_AOB_State then
+    _G.OoT_AOB_State.cancelled=true
+    if _G.OoT_AOB_State.closeInventory then pcall(_G.OoT_AOB_State.closeInventory) end
+    if _G.OoT_AOB_State.timer then pcall(function() _G.OoT_AOB_State.timer.destroy() end) end
+  end
+  for _,s in ipairs(RS) do pcall(unregisterSymbol,s) end
+  for _,s in ipairs(inventorySymbols) do pcall(unregisterSymbol,s) end
+  for _,s in ipairs(HS) do pcall(unregisterSymbol,s) end
+  for _,s in ipairs(MS) do pcall(unregisterSymbol,s) end
+  _G.OoT_AOB_State=nil
+  _G.OoT_RetryHearts=nil
+end
+cleanup()
+local state={cancelled=false,pid=getOpenedProcessID(),rupees=false,hearts=false}
+_G.OoT_AOB_State=state
+local function active()
+  return _G.OoT_AOB_State==state and not state.cancelled and getOpenedProcessID()==state.pid
+end
+local function u32(a)
+  local ok,v=pcall(readInteger,a)
+  if ok and type(v)=='number' then return v%4294967296 end
+end
+local function ri(a)
+  local ok,v=pcall(readInteger,a)
+  if ok and type(v)=='number' then return v end
+end
+local function rb(a)
+  local ok,v=pcall(readBytes,a,1,false)
+  if ok and type(v)=='number' then return v end
+end
+local function u16(a)
+  local x,y=rb(a),rb(a+1)
+  if x and y then return x+256*y end
+end
+local function readRupeeCandidates(r)
+  local w=r+0x230
+  local x,y,c,d=u32(r),u32(r+4),u32(w),u32(w+4)
+  if x==nil or y==nil or c==nil or d==nil then return nil,'unreadable' end
+  if c~=99 and c~=200 and c~=500 and c~=1000 then return nil,'wallet capacity' end
+  if x&gt;c or y&gt;1000 then return nil,'rupee values' end
+  return {r=r,w=w,x=x,y=y,c=c,d=d}
+end
+local function validRupeeRecord(anchor)
+  local candidate,reason=readRupeeCandidates(anchor-0x10)
+  if not candidate then return nil,reason end
+  local r,w=candidate.r,candidate.w
+  if u32(w+0x08)~=0 or u32(w+0x10)~=0 or u32(w+0x14)~=0x20 or u32(w+0x18)~=1 then
+    return nil,'wallet metadata'
+  end
+  local marker=u32(r+0x0C)
+  if not marker or marker==0 or u32(r+0x34)~=marker or u32(r+0x5C)~=marker or u32(w+0x0C)~=marker then
+    return nil,'record marker'
+  end
+  return candidate
+end
+local function validLegacyRupees(anchor)
+  return readRupeeCandidates(anchor-0x20)
+end
+local function mappedPage(address)
+  local ok,bytes=pcall(readBytes,address-address%0x1000,0x1000,true)
+  if ok and type(bytes)=='table' and #bytes==0x1000 then return table.concat(bytes,',') end
+end
+local mappedType=0x40000
+local function mappedAllocation(address)
+  local region=getMemoryRegionInfo(address)
+  if region and region.Type==mappedType then return region.AllocationBase end
+end
+local function physicalCandidate(candidates,addressKey)
+  if type(getMemoryRegionInfo)~='function' then return nil end
+  -- On Windows the Switch 2 14 GiB RAM backing and its fastmem views can
+  -- expose the same data at different host addresses. Verify the backing
+  -- allocation boundaries and compare the mapped pages before selecting it.
+  local backingSize=0x380000000
+  local backing,allocation
+  local views={}
+  for _,candidate in ipairs(candidates) do
+    local base=mappedAllocation(candidate[addressKey])
+    if not base then return nil end
+    views[candidate]=base
+    local last=getMemoryRegionInfo(base+backingSize-1)
+    local nextRegion=getMemoryRegionInfo(base+backingSize)
+    if last and last.Type==mappedType and last.AllocationBase==base and
+       nextRegion and nextRegion.AllocationBase~=base then
+      if backing then return nil end
+      backing,allocation=candidate,base
+    end
+  end
+  if not backing then return nil end
+  local backingAddress=backing[addressKey]
+  local page=mappedPage(backingAddress)
+  if not page then return nil end
+  local offsets={}
+  for _,candidate in ipairs(candidates) do
+    if candidate~=backing then
+      local address=candidate[addressKey]
+      local base=views[candidate]
+      if base==allocation or offsets[base] or address%0x1000~=backingAddress%0x1000 or mappedPage(address)~=page then
+        return nil
+      end
+      offsets[base]=address-backingAddress
+    end
+  end
+  if mappedPage(backingAddress)~=page then return nil end
+  return backing,{allocation=allocation,offsets=offsets}
+end
+local function vitalCandidateFromRupees(candidates,addressKey)
+  local rupeeViews=state.rupeeViews
+  if not rupeeViews then return nil end
+  local backing
+  local views={}
+  for _,candidate in ipairs(candidates) do
+    local address=candidate[addressKey]
+    local base=mappedAllocation(address)
+    if not base or views[base] then return nil end
+    views[base]=address
+    if base==rupeeViews.allocation then backing=candidate end
+  end
+  if not backing then return nil end
+  -- Use the alias offsets verified on the rupee pages in this session.
+  -- An unrelated write on a health page can race a whole-page comparison.
+  for base,address in pairs(views) do
+    if base~=rupeeViews.allocation and rupeeViews.offsets[base]~=address-backing[addressKey] then return nil end
+  end
+  return backing
+end
+local B60={0xFF,0xFF,0xFF,0xFF,0,0,0,0,0,0,0x80,0xBF,0,0,0,0,0,0,0x80,0xBF,0,0,0,0,0,0,0x80,0xBF,0,0,0,0}
+local BA0={0,0,0x80,0xBF,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+local BC0={0,0,0,0,0,0,0,0,0,0,0,0x40,0,0,0,0x40,0,0,0x80,0xBF,0,0,0,0,0,0,0,0,0,0,0,0}
+local function block(a,b)
+  for i=1,#b do if rb(a+i-1)~=b[i] then return false end end
+  return true
+end
+local function validHeartRecord(anchor)
+  local h=anchor-4
+  local a,b=ri(h),ri(h+0x10)
+  if not (a and b and a&gt;=0 and a&lt;=b and b&gt;0 and b&lt;=320) then return nil,'health' end
+  if u32(h+4)~=0x31AB5580 or u32(h+0x14)~=0xFBE01DA1 then return nil,'hashes' end
+  return {h=h,a=a,b=b}
+end
+local function activeHeartOwner()
+  local address=state.heartAddress
+  if not address or not validHeartRecord(address+4) then return nil end
+  local ok,owner,other=pcall(function() return readQword(address+0x20),readQword(address-0x28) end)
+  if ok and owner and owner~=0 and other==owner then return owner end
+end
+local function validActiveMagic(anchor)
+  local address=anchor+0x0C
+  local value=u32(address)
+  if not value or value&gt;480 then return nil,'magic' end
+  if u32(anchor)~=0x76B18200 or u32(anchor+4)~=0x12D63A97 or u32(anchor+8)~=0x3AFA3349 then
+    return nil,'magic hashes'
+  end
+  -- Link's child and adult actors can both have an MP object. Resolve the
+  -- one that shares the guest actor pointer carried by the live HP object.
+  local owner=activeHeartOwner()
+  if not owner or readQword(address-0x3C)~=owner or readQword(address+0xD4)~=owner then
+    return nil,'different player actor'
+  end
+  return {m=address,value=value}
+end
+local function validLegacyHearts(anchor)
+  local h=anchor-0xE0
+  local id1,id2=u16(anchor),u16(anchor+12)
+  if not (id1 and id2 and id1~=65535 and id2==id1+1) then return nil,'ids' end
+  if not (ri(anchor+4)==2 and ri(anchor+8)==1 and ri(anchor+16)==2 and ri(anchor+20)==1) then return nil,'ids' end
+  -- Current health and maximum health are distinct fields at +0 and +0x10.
+  -- Values can legitimately change while the game runs; reject only impossible values.
+  local a,b=ri(h),ri(h+0x10)
+  if not (a and b and a&gt;=0 and a&lt;=320 and b&gt;=0 and b&lt;=320) then return nil,'health' end
+  local p60=block(h+0x60,B60)
+  local pa0=block(h+0xA0,BA0)
+  local pc0=block(h+0xC0,BC0)
+  -- Exact validation is preferred. The +60 block may vary between frames;
+  -- relaxed selection is allowed ONLY when it is the sole matching candidate.
+  if not pa0 then return nil,'a0' end
+  if not pc0 then return nil,'c0' end
+  return {h=h,a=a,b=b,strict=p60}
+end
+-- 1.1.1 GameData schemas checked against the runtime hash/index tables.
+local INVENTORY_INT_INDEX={
+  [0xE753508B]=972,
+  [0x735B00F7]=973,
+  [0xAE8CC742]=974,
+  [0x457616B0]=975,
+  [0xB003124D]=1032,
+  [0x4735978]=1065,
+  [0x51EC97B3]=1072,
+  [0x7DD79D10]=178,
+  [0x90237092]=190,
+  [0x1DF11487]=187,
+  [0x877BDCEE]=217,
+  [0x5EDDA9E3]=211,
+  [0x79EEEC8E]=214,
+  [0x3A28B6A4]=193,
+  [0xEA9786F5]=196,
+  [0xFBFD2910]=202,
+  [0x76B18200]=965,
+  [0x12D63A97]=967,
+  [0x40AE1183]=977,
+  [0x12B8C0]=978,
+  [0x21ECBD19]=979,
+  [0x2BAD189A]=980,
+  [0xC9220366]=981,
+  [0x6F631388]=982,
+  [0xB816AF94]=983,
+  [0xD1317941]=984,
+  [0xF5E647DA]=985,
+  [0x486C59A4]=986,
+  [0x7E607033]=987,
+  [0xE94A8DF]=988,
+  [0xFC508DA7]=989,
+  [0xB5C10899]=990,
+  [0x47B2D775]=991,
+  [0xF046629E]=992,
+  [0x96459CD3]=993,
+  [0x924E9A46]=994,
+  [0x49D1C374]=995,
+  [0xF3B14CE2]=1001,
+  [0xB6CA6093]=1002,
+  [0x5E529AB9]=1003,
+  [0x40735A8D]=1004,
+  [0xBFB285C8]=1005,
+  [0xA1D76D31]=1012,
+  [0x2815C82A]=1013,
+  [0xDED8E8D3]=1017,
+  [0x51D89EF0]=1018,
+  [0xB796C16D]=1022,
+  [0x919EA324]=1023,
+  [0x5C41A6B1]=1024,
+  [0x47F2CA87]=1028,
+  [0x1AAFDB66]=1029,
+  [0x8573D2CD]=1030,
+  [0x8499EA34]=1031,
+  [0x5CE254A6]=1033,
+  [0x692D57CB]=1034,
+  [0x235C7D9A]=1035,
+  [0x204D2063]=1036,
+  [0xC7A5FD0]=1037,
+  [0x151A68F]=1038,
+  [0xF0828CD0]=1039,
+  [0xB7DF60F1]=1044,
+  [0x54E2A3D1]=1045,
+  [0x7DE3E6F]=1046,
+  [0x58C9BC78]=1047,
+  [0xA862D276]=1048,
+  [0x165E7CA]=1049,
+  [0x7F10AAF]=1050,
+  [0x897CF7EB]=1051,
+  [0x4AEB140A]=1055,
+  [0x1240044B]=1056,
+  [0x7D69AD47]=1061,
+  [0xCBD1E58C]=1062,
+  [0xB8E3BF45]=1063,
+  [0xFEB4D56B]=1064,
+  [0x24596E8E]=1069,
+  [0x6BE5C3B0]=1070,
+  [0x84BA0D24]=1071,
+  [0x938D56BF]=1077,
+  [0x80D34CE9]=1078,
+  [0x7CA64F23]=1079,
+  [0x8BEFD3A]=1080,
+  [0xF58E0E2F]=1081,
+  [0xB0B3E399]=1082,
+  [0x8D02F5EA]=1083,
+  [0x396A5C02]=1084,
+  [0xEEB495B9]=1085,
+  [0xF1C45294]=1086,
+  [0xD53CE3A7]=996,
+  [0xFCA29A04]=997,
+  [0x893216A1]=998,
+  [0x5324F9D3]=999,
+  [0xC92B16BE]=1000,
+  [0xBD3CA2C6]=1008,
+  [0xE5FF45AA]=1009,
+  [0xB0A1BF51]=1010,
+  [0x7B9673F5]=1014,
+  [0x9A30A9E5]=1015,
+  [0xDC52ACAF]=1016,
+  [0x9A826FAB]=1025,
+  [0xD60E4B23]=1041,
+  [0xEAA1785E]=1042,
+  [0x19B80DBC]=1043,
+  [0xD331C7DA]=1052,
+  [0x3BB370E1]=1053,
+  [0xA8C3E1FB]=1054,
+  [0x48E53698]=1058,
+  [0x41DB7AB5]=1059,
+  [0x2FE6AB1A]=1060,
+  [0xAFA4BB52]=1066,
+  [0x2D2C874B]=1067,
+  [0x1D74617E]=1068,
+  [0x20820479]=1073,
+  [0xE32AD20F]=1074,
+  [0x667C7BA3]=1075,
+  [0x28298287]=1076,
+  [0x5E671D92]=1026,
+  [0x5F043856]=1027,
+}
+local ITEM_DEFINITIONS={
+  [1100]={0x40ae1183,0x3ef15ec4,0x74223e63,'Armor_Adult_Gauntlet_Gold'},
+  [1101]={0x12b8c0,0x87e58de3,0x30f1cdf,'Armor_Adult_Gauntlet_Silver'},
+  [1102]={0x21ecbd19,0xae5611af,0x90c41a9c,'Armor_Adult_Goron'},
+  [1103]={0x2bad189a,0x5fa190e6,0x626f6db7,'Armor_Adult_HeavyBoot'},
+  [1104]={0xc9220366,0x1109c920,0x58fd8291,'Armor_Adult_HoverBoot'},
+  [1105]={0x6f631388,0xde513abd,0x511b04f,'Armor_Adult_Normal'},
+  [1106]={0xb816af94,0x4f5a929c,0x3dcc4837,'Armor_Adult_Zora'},
+  [1107]={0xd1317941,0x9880707e,0x6fd3dd83,'Armor_Child_Gauntlet_Goron'},
+  [1108]={0xf5e647da,0x6f13bb2,0x826db2f9,'Armor_Child_Mask_Amiibo0'},
+  [1109]={0x486c59a4,0x9df9d25,0x62b873a9,'Armor_Child_Mask_Amiibo1'},
+  [1110]={0x7e607033,0x65aebe17,0x4641175c,'Armor_Child_Mask_Bunny'},
+  [1111]={0xe94a8df,0xb1fc4c1d,0xde002422,'Armor_Child_Mask_Gerudo'},
+  [1112]={0xfc508da7,0xadfccd91,0x6614d5,'Armor_Child_Mask_Goron'},
+  [1113]={0xb5c10899,0x35c60e1d,0xbcc6e7ee,'Armor_Child_Mask_Keaton'},
+  [1114]={0x47b2d775,0xd097482a,0x52ad260a,'Armor_Child_Mask_Skull'},
+  [1115]={0xf046629e,0xc0cf68a7,0xebd0f400,'Armor_Child_Mask_Spooky'},
+  [1116]={0x96459cd3,0xf7d5bd9c,0x7b320777,'Armor_Child_Mask_Truth'},
+  [1117]={0x924e9a46,0x280eb00e,0xe47ce994,'Armor_Child_Mask_Zora'},
+  [1118]={0x49d1c374,0x7fe2a5b2,0xf88a5456,'Armor_GlassTruth'},
+  [1119]={0xf3b14ce2,0xdd587ed8,0xc8791bc8,'Item_AgonyStone'},
+  [1120]={0xb6ca6093,0x14909166,0xabefb0d8,'Item_AlarmCucco'},
+  [1121]={0x5e529ab9,0x4db7eae0,0x4ff00a5e,'Item_Arrow_Fire'},
+  [1122]={0x40735a8d,0x5c8f3099,0xa2ec3d6f,'Item_Arrow_Ice'},
+  [1123]={0xbfb285c8,0x8637bab4,0xe0f988c,'Item_Arrow_Light'},
+  [1124]={0xa1d76d31,0x7f4ce38d,0xd738eea4,'Item_Boomerang'},
+  [1125]={0x2815c82a,0x645a8175,0x4ff0794b,'Item_BrokenSword'},
+  [1126]={0xded8e8d3,0x8b54e680,0x7c07379b,'Item_ClaimCheck'},
+  [1127]={0x51d89ef0,0xfb4442de,0x3b071d8c,'Item_CojiroCucco'},
+  [1128]={0xb796c16d,0xfa04e611,0x5bbda299,'Item_DinFire'},
+  [1129]={0x919ea324,0x8e02d1ca,0x4951fbd0,'Item_EyeballFrog'},
+  [1130]={0x5c41a6b1,0xb7bdd577,0x8f7048d1,'Item_EyeDrop'},
+  [1131]={0x47f2ca87,0xffabf058,0xa58bce59,'Item_FaroreWind'},
+  [1132]={0x1aafdb66,0x7227efd8,0x989d3940,'Item_Hammer'},
+  [1133]={0x8573d2cd,0xff98ed58,0xbbf1d643,'Item_Hookshot'},
+  [1134]={0x8499ea34,0x38aea3bb,0x9a66bde3,'Item_Longshot'},
+  [1135]={0x5ce254a6,0x103a0dc7,0xd4fb9d9d,'Item_Medal_Fire'},
+  [1136]={0x692d57cb,0xfcd8d653,0x413dcc88,'Item_Medal_Forest'},
+  [1137]={0x235c7d9a,0x9026c187,0xc9c90dae,'Item_Medal_Light'},
+  [1138]={0x204d2063,0x12d63ac6,0x1581d060,'Item_Medal_Shadow'},
+  [1139]={0xc7a5fd0,0xe269df38,0x67a9036c,'Item_Medal_Spirit'},
+  [1140]={0x151a68f,0xcf64e780,0x43eb4899,'Item_Medal_Water'},
+  [1141]={0xf0828cd0,0xb44241,0x5dc5fcde,'Item_NayruLove'},
+  [1142]={0xb7df60f1,0x42bd296f,0x137df1ac,'Item_Ocarina_Fairy'},
+  [1143]={0x54e2a3d1,0x1da2c511,0xac6a85e3,'Item_Ocarina_Time'},
+  [1144]={0x7de3e6f,0xcbd7852a,0x7217d317,'Item_OddMushroom'},
+  [1145]={0x58c9bc78,0xb75acaad,0xee1fd8ef,'Item_OddPowder'},
+  [1146]={0xa862d276,0x888d5059,0x30a5eb7c,'Item_PoacherSaw'},
+  [1147]={0x165e7ca,0xe82e6413,0xb5d12c73,'Item_PocketCucco'},
+  [1148]={0x7f10aaf,0xec9c3136,0x31274652,'Item_PocketEgg'},
+  [1149]={0x897cf7eb,0xd8f1521e,0xdc2966d5,'Item_Prescription'},
+  [1150]={0x4aeb140a,0xccc1909a,0x99394e23,'Item_Scale_Gold'},
+  [1151]={0x1240044b,0x1208fb3e,0x131029c2,'Item_Scale_Silver'},
+  [1152]={0x7d69ad47,0x8908d6ad,0xa9563368,'Item_Stone_Fire'},
+  [1153]={0xcbd1e58c,0x110b83ec,0xb70c3e4d,'Item_Stone_Forest'},
+  [1154]={0xb8e3bf45,0xeec383f5,0x7fa8ce6e,'Item_Stone_Water'},
+  [1155]={0xfeb4d56b,0xe6264c7,0x6c031103,'Item_Token_Gerudo'},
+  [1156]={0x24596e8e,0x44ab1487,0xdaeed0ff,'Item_WeirdEgg'},
+  [1157]={0x6be5c3b0,0xf19393b5,0xeca7f942,'Item_ZeldaLetter'},
+  [1158]={0x84ba0d24,0xf9594156,0xe7bfd492,'Obj_Armor_Child_Normal'},
+  [1159]={0x938d56bf,0x69ec28be,0x5a25d660,'Weapon_Range_Bow'},
+  [1160]={0x80d34ce9,0xec22ee1,0xa690f73d,'Weapon_Range_SlingShot'},
+  [1161]={0x7ca64f23,0x5217da1e,0x432325de,'Weapon_Shield_Deku'},
+  [1162]={0x8befd3a,0x2f817d54,0x11be007e,'Weapon_Shield_Hylian'},
+  [1163]={0xf58e0e2f,0x75e94e42,0xeda74316,'Weapon_Shield_Mirror'},
+  [1164]={0xb0b3e399,0x33466812,0xbfe33f2e,'Weapon_Sword_Biggoron'},
+  [1165]={0x8d02f5ea,0x720df203,0xfceda034,'Weapon_Sword_BrokenGiant'},
+  [1166]={0x396a5c02,0x1e824efa,0x1f0bb385,'Weapon_Sword_Giant'},
+  [1167]={0xeeb495b9,0x405d8a0f,0x4df9a16,'Weapon_Sword_Kokiri'},
+  [1168]={0xf1c45294,0x7ae38e5b,0x2d11dc8b,'Weapon_Sword_Master'},
+  [1169]={0x2B043D6D,0x1A29C471,0x93CC6410,'Armor_Child_Mask_Amiibo2'},
+  [1560]={0xBD3CA2C6,0x968A5A79,0x2FDB1562,'Item_BombBag_Large'},
+  [1561]={0xE5FF45AA,0xB2C478DA,0xAD234438,'Item_BombBag_Medium'},
+  [1562]={0xB0A1BF51,0xA63F1E2D,0x4D345BBE,'Item_BombBag_Small'},
+  [1563]={0x7B9673F5,0xB669F025,0x1C0B4BEC,'Item_BulletBag_Large'},
+  [1564]={0x9A30A9E5,0xE6CD55D2,0x78681CDD,'Item_BulletBag_Medium'},
+  [1565]={0xDC52ACAF,0x488CA1BE,0xB66EC399,'Item_BulletBag_Small'},
+  [1566]={0x9A826FAB,0x944B78BE,0xC1B79C02,'Item_FairyBless_DefenseDouble'},
+  [1567]={0xD60E4B23,0x9A5DB0B6,0x195DE3FF,'Item_NutBag_Large'},
+  [1568]={0xEAA1785E,0x960820DB,0x315DA972,'Item_NutBag_Medium'},
+  [1569]={0x19B80DBC,0x2BEDD82E,0xFBFDA62B,'Item_NutBag_Small'},
+  [1570]={0xD331C7DA,0x21985B09,0x7E6DF1D,'Item_Quiver_Large'},
+  [1571]={0x3BB370E1,0x9D872202,0xD70016F1,'Item_Quiver_Medium'},
+  [1572]={0xA8C3E1FB,0xA550531,0xCE1AA33D,'Item_Quiver_Small'},
+  [1573]={0x48E53698,0xA10F2DCF,0x42F9F847,'Item_StickBag_Large'},
+  [1574]={0x41DB7AB5,0xCBF00480,0x435380E7,'Item_StickBag_Medium'},
+  [1575]={0x2FE6AB1A,0xDE2389D4,0x269A4B46,'Item_StickBag_Small'},
+  [1576]={0xAFA4BB52,0xB5031190,0x65796826,'Item_Wallet_Large'},
+  [1577]={0x2D2C874B,0xD1360DE8,0x6093656F,'Item_Wallet_Medium'},
+  [1578]={0x1D74617E,0xB6E5A3A5,0x4F4EB2F1,'Item_Wallet_Small'},
+  [1579]={0x20820479,0x3506A557,0x51496D45,'Pouch_Amiibo'},
+  [1580]={0xE32AD20F,0xF9FE4FFC,0x48A03E62,'Pouch_Range_BowAndArrow_Fire'},
+  [1581]={0x667C7BA3,0x989E62D,0x6A86B26E,'Pouch_Range_BowAndArrow_Ice'},
+  [1582]={0x28298287,0xB03AE135,0x9B869C05,'Pouch_Range_BowAndArrow_Light'},
+}
+local BOTTLE_DEFINITIONS={
+  [1530]={0xD53CE3A7,0xF39CE410,0x7D48DF76},
+  [1531]={0xFCA29A04,0xFF6EA,0x1EDD164A},
+  [1532]={0x893216A1,0xF63B1194,0xB80C70A8},
+  [1533]={0x5324F9D3,0xB7F052CE,0xE4C1B1FC},
+  [1534]={0xC92B16BE,0xE27B136D,0x365E1953},
+}
+local MAGIC_BLESSINGS={
+  {0x5E671D92,0xB1309073,0x958C80F},
+  {0x5F043856,0x87CA4826,0x9393E906},
+}
+
+local function bytesAt(address,size)
+  local ok,bytes=pcall(readBytes,address,size,true)
+  if ok and type(bytes)=='table' and #bytes==size then return bytes end
+end
+local function littleU32(bytes,i)
+  return bytes[i] | bytes[i+1]&lt;&lt;8 | bytes[i+2]&lt;&lt;16 | bytes[i+3]&lt;&lt;24
+end
+local function typedLookup(first,count)
+  -- GameData keeps two hash/index buckets per record directly before the array.
+  local bytes=bytesAt(first-count*16,count*16)
+  if not bytes then return nil end
+  local indices,seen={},{}
+  local used=0
+  for i=1,#bytes,8 do
+    local hash,index=littleU32(bytes,i),littleU32(bytes,i+4)
+    if hash~=0 then
+      if index&gt;=count or indices[hash] or seen[index] then return nil end
+      indices[hash]=index
+      seen[index]=true
+      used=used+1
+    end
+  end
+  if used==count then return indices end
+end
+local function findRecords(root,tag,fromOffset,toOffset,stride,valueOffset,count,anchorHash,anchorIndex)
+  local start=root+fromOffset
+  start=start-start%8
+  local bytes=bytesAt(start,toOffset-fromOffset)
+  if not bytes then return nil end
+  for i=1,#bytes-stride*2-3,8 do
+    if littleU32(bytes,i)==tag and littleU32(bytes,i+stride)==tag and littleU32(bytes,i+2*stride)==tag and
+       (i&lt;=stride or littleU32(bytes,i-stride)~=tag) then
+      local first=start+i-1
+      local indices=typedLookup(first,count)
+      if indices and indices[anchorHash]==anchorIndex then
+        return {first=first,tag=tag,stride=stride,valueOffset=valueOffset,indices=indices}
+      end
+    end
+  end
+end
+local function field(records,hash)
+  local index=records and records.indices[hash]
+  if not index then return nil end
+  local entry=records.first+index*records.stride
+  if u32(entry)==records.tag then return entry+records.valueOffset end
+end
+local function readInventory(root)
+  local first=root-962*0x28-0x1C
+  local tag=u32(first)
+  if not tag or tag==0 then return nil end
+  local indices=typedLookup(first,1260) or typedLookup(first,1259)
+  if not indices or indices[0xA77921D7]~=962 or indices[0xE0010A50]~=976 then return nil end
+  for hash,index in pairs(INVENTORY_INT_INDEX) do
+    if indices[hash]~=index or u32(first+index*0x28)~=tag then return nil end
+  end
+  local hasMajora=indices[0x2B043D6D]==1259
+  local inventory={root=root,int={first=first,tag=tag,stride=0x28,valueOffset=0x1C,indices=indices}}
+  inventory.bool=findRecords(root,tag-0xC0,-0x68000,-0x56000,0x18,0x16,
+    hasMajora and 11305 or 11292,0x7AE38E5B,0x2337)
+  inventory.enum=findRecords(root,tag+0x180,0x15000,0x20000,0x38,0x1C,130,0x7D48DF76,60)
+  inventory.string=findRecords(root,tag+0x540,0x22000,0x30000,0x108,0x74,54,0xA95A3521,23)
+  return inventory
+end
+local function readField(address,size)
+  if size==1 then return rb(address) end
+  if size==64 then return readString(address,64) end
+  return u32(address)
+end
+local function planWrite(changes,address,size,value)
+  if not address then error('The required GameData field was not verified.') end
+  local before=readField(address,size)
+  if before==nil then error('The GameData field is no longer readable.') end
+  if size==1 and before&gt;1 then error('The acquisition flag has an unexpected value.') end
+  if before~=value then changes[#changes+1]={address=address,size=size,before=before,value=value} end
+end
+local function readChange(change)
+  return readField(change.address,change.size)
+end
+local function writeChange(change,value)
+  if change.size==1 then writeBytes(change.address,value)
+  elseif change.size==64 then
+    local bytes={}
+    for i=1,64 do bytes[i]=value:byte(i) or 0 end
+    writeBytes(change.address,bytes)
+  else writeInteger(change.address,value) end
+end
+local function commitChanges(changes)
+  local applied=0
+  local ok,err=pcall(function()
+    for i,change in ipairs(changes) do
+      if readChange(change)~=change.before then error('The game changed a field while preparing the edit.') end
+      applied=i
+      writeChange(change,change.value)
+      if readChange(change)~=change.value then error('Could not verify a GameData write.') end
+    end
+  end)
+  if ok then return end
+  local restored=true
+  for i=applied,1,-1 do
+    local change=changes[i]
+    if readChange(change)==change.value then
+      local wrote=pcall(writeChange,change,change.before)
+      if not wrote or readChange(change)~=change.before then restored=false end
+    elseif readChange(change)~=change.before then restored=false end
+  end
+  if not restored then error(tostring(err)..' The rollback could not be verified.') end
+  error(err)
+end
+local function planAcquisition(changes,inventory,definition)
+  planWrite(changes,field(inventory.bool,definition[2]),1,1)
+  planWrite(changes,field(inventory.bool,definition[3]),1,1)
+end
+local function checkUnequipped(inventory,actor)
+  if actor=='Armor_Adult_Normal' or actor=='Obj_Armor_Child_Normal' then
+    error('The default tunic cannot be removed.')
+  end
+  if not actor:match('^Weapon_Sword_') and not actor:match('^Weapon_Shield_') then return end
+  for _,hash in ipairs({0xA95A3521,0xEE463235,0xA1F7EE2B,0x2342B619}) do
+    local address=field(inventory.string,hash)
+    local equipped=address and readString(address,64)
+    if equipped==nil then error('The equipment for both eras could not be checked.') end
+    if equipped==actor then error('Unequip this item in both eras before removing it.') end
+  end
+end
+local function changeOwnership(inventory,record,definition,bottle)
+  local address=field(inventory.int,definition[1])
+  local old=address and u32(address)
+  if old==nil or (not bottle and old~=0 and old~=1) then error('The item stock could not be verified.') end
+  local owned=old&gt;0
+  local nextStock=owned and 0 or 1
+  local changes={}
+  if bottle then
+    local valid=field(inventory.bool,definition[2])
+    local content=field(inventory.enum,definition[3])
+    if not valid or not content or rb(valid)~=(owned and 1 or 0) then error('The bottle ownership fields could not be verified.') end
+    planWrite(changes,content,4,0xBE69DE49)
+    planWrite(changes,valid,1,nextStock)
+  elseif not owned then
+    planAcquisition(changes,inventory,definition)
+  else
+    checkUnequipped(inventory,definition[4])
+  end
+  planWrite(changes,address,4,nextStock)
+  local question=(owned and 'Remove ' or 'Unlock ')..record.Description..'?'
+  if bottle and owned then question=question..'\nThis also empties the bottle.' end
+  if messageDialog(question,mtConfirmation,mbYes,mbNo)==mrYes and active() then
+    commitChanges(changes)
+    if bottle and state.bottleContents then state.bottleContents[record.ID]=nil end
+    if bottle and state.bottlePending then state.bottlePending[record.ID]=nil end
+  end
+end
+local function changeMagicMeter(inventory)
+  local maximum=field(inventory.int,0x12D63A97)
+  local before=maximum and u32(maximum)
+  if before~=0 and before~=240 and before~=480 then error('The current magic tier could not be verified.') end
+  local answer=inputQuery('Magic Meter','Enter 24 or 48 MP',tostring(before/10))
+  if not answer or not active() then return end
+  local mp=tonumber(answer)
+  if (mp~=24 and mp~=48) or mp*10&lt;before then error('Choose the current magic tier or an upgrade.') end
+  local changes={}
+  planAcquisition(changes,inventory,MAGIC_BLESSINGS[1])
+  planWrite(changes,field(inventory.int,MAGIC_BLESSINGS[1][1]),4,1)
+  if mp==48 then
+    planAcquisition(changes,inventory,MAGIC_BLESSINGS[2])
+    planWrite(changes,field(inventory.int,MAGIC_BLESSINGS[2][1]),4,1)
+  end
+  planWrite(changes,maximum,4,mp*10)
+  planWrite(changes,field(inventory.int,0x76B18200),4,mp*10)
+  if state.magicAddress and validActiveMagic(state.magicAddress-0x0C) then
+    planWrite(changes,state.magicAddress,4,mp*10)
+  end
+  commitChanges(changes)
+end
+
+-- Each stock has a separate IsGet flag. Seeds and arrows also require their launcher.
+local CONSUMABLES={
+  {stock=0x5FADF7FC, acquired=0x29888E1E, capacity=0xAE8CC742, tool=0x80D34CE9}, -- Deku Seeds
+  {stock=0x518EC74B, acquired=0x572701EA, capacity=0x418DB791, tool=0x938D56BF}, -- Arrows
+  {stock=0xDB1BCD4F, acquired=0x2BB00768, capacity=0xE753508B}, -- Bombs
+  {stock=0xDF7C517A, acquired=0x5AB49C8E, capacity=0xE753508B}, -- Bombchus
+  {stock=0xF30D9F54, acquired=0x00C2EE37, capacity=0x735B00F7}, -- Deku Nuts
+  {stock=0x600E29EB, acquired=0xCFBB16F6, limit=30}, -- Business Scrub Seeds
+  {stock=0xB003124D, acquired=0x6D39C600, limit=10}, -- Magic Beans
+  {stock=0xB9494411, acquired=0xC4E21AC2, capacity=0x457616B0}, -- Deku Sticks
+}
+local function refillConsumables()
+  local inventory=state.inventory
+  if not inventory then return end
+  for _,item in ipairs(CONSUMABLES) do
+    local stock=field(inventory.int,item.stock)
+    local value=stock and ri(stock)
+    local flag=field(inventory.bool,item.acquired)
+    if value and value&gt;0 and flag and rb(flag)==1 then
+      local capacity=field(inventory.int,item.capacity)
+      local ceiling=item.limit or (capacity and ri(capacity))
+      local tool=item.tool and field(inventory.int,item.tool)
+      if ceiling and value&lt;ceiling and (not item.tool or (tool and ri(tool)==1)) and ri(stock)==value then
+        writeInteger(stock,ceiling)
+      end
+    end
+  end
+end
+
+local EMPTY_BOTTLE, FULL_MILK, HALF_MILK=0xBE69DE49,0x73356827,0xEEF6E4B0
+local BOTTLE_CONTENTS={
+  [0xEABA6067]=true, [0x049D37C1]=true, [0xF383D6E5]=true, -- Potions
+  [0x1C293517]=true, [0x1E834EF8]=true, [0x0F24E808]=true, -- Blue Fire, Fish, Letter
+  [0xCDC21471]=true, [0x02084F9E]=true, [0x74D62ECB]=true, -- Big Poe, Poe, Bug
+  [0x6F49E357]=true, [FULL_MILK]=true, [HALF_MILK]=true, -- Fairy and Milk
+}
+local function bottleActionReady(fastmem)
+  local owner=activeHeartOwner()
+  if not owner then return nil end
+  local actor=fastmem+owner
+  local primary,secondary=u32(actor+0x4AC),u32(actor+0xC54)
+  if not primary or not secondary or (secondary &amp; 0xFFFF0000)~=0x01FF0000 then return nil end
+  local ok,attachment=pcall(readQword,actor+0x1990)
+  if not ok or attachment==nil then return nil end
+  -- These action flags remain set after the bottle becomes empty. The
+  -- actor's attachment returns only once the native action has finished.
+  return (primary &amp; 0x80)==0 and (secondary &amp; 0x40)==0 and attachment~=0
+end
+local function bottleFastmemBase(inventory)
+  local views=state.rupeeViews
+  local head=field(inventory.string,0x59D9C7B3)
+  local weapon=field(inventory.string,0xA95A3521)
+  if not views or not head or not weapon then return nil end
+  for allocation,delta in pairs(views.offsets) do
+    local aliasHead,aliasWeapon=head+delta,weapon+delta
+    if mappedAllocation(aliasHead)==allocation and mappedAllocation(aliasWeapon)==allocation then
+      -- Both String64 buffers carry their own guest address at value - 0x0C.
+      local h,w=readQword(aliasHead-0x0C),readQword(aliasWeapon-0x0C)
+      if h and w and h&gt;0 and w&gt;0 then
+        local base=aliasHead-h
+        if base&gt;0 and base%0x10000==0 and base==aliasWeapon-w and bottleActionReady(base)~=nil then
+          return base
+        end
+      end
+    end
+  end
+end
+local function refillBottles()
+  local inventory=state.inventory
+  local remembered=state.bottleContents
+  local pending=state.bottlePending
+  if not inventory or not remembered or not pending then return end
+  local ready=bottleActionReady(state.bottleFastmem)
+  local now=getTickCount()
+  if ready==nil and not activeHeartOwner() and state.refreshVital then state.refreshVital('hearts') end
+  for id,definition in pairs(BOTTLE_DEFINITIONS) do
+    local stock=field(inventory.int,definition[1])
+    local valid=field(inventory.bool,definition[2])
+    local content=field(inventory.enum,definition[3])
+    if stock and (ri(stock) or 0)&gt;0 and valid and rb(valid)==1 and content then
+      local value=u32(content)
+      local previous=remembered[id]
+      if previous and (value==EMPTY_BOTTLE or (previous==FULL_MILK and value==HALF_MILK)) then
+        local refill=pending[id]
+        if not refill or refill.after~=value then
+          refill={after=value,since=now}
+          pending[id]=refill
+        end
+        if ready then
+          refill.readySince=refill.readySince or now
+          if now-refill.since&gt;=2500 and now-refill.readySince&gt;=120 and
+             u32(content)==value and rb(valid)==1 and (ri(stock) or 0)&gt;0 and bottleActionReady(state.bottleFastmem) then
+            writeInteger(content,previous)
+          end
+        else
+          refill.readySince=nil
+        end
+      elseif BOTTLE_CONTENTS[value] then
+        remembered[id]=value
+        pending[id]=nil
+      elseif value~=EMPTY_BOTTLE then
+        remembered[id]=nil
+        pending[id]=nil
+      end
+    else
+      remembered[id]=nil
+      pending[id]=nil
+    end
+  end
+end
+
+local function refillTarget(kind)
+  if kind=='magic' then
+    local address=state.magicAddress
+    local live=address and validActiveMagic(address-0x0C)
+    if not live then return nil end
+    local maximum=field(state.inventory and state.inventory.int,0x12D63A97)
+    local cap=maximum and u32(maximum)
+    if cap~=240 and cap~=480 then return address end
+    return address,live.value,cap
+  end
+  if kind=='hearts' then
+    local address=state.heartAddress
+    if not address then return nil end
+    local live=state.legacyHearts and validLegacyHearts(address+0xE0) or validHeartRecord(address+4)
+    if live then return address,live.a,live.b end
+    return nil
+  end
+  local address=state.rupeeAddress
+  local live=address and readRupeeCandidates(address)
+  if live then return address,live.x,live.c end
+end
+local function setRefill(kind,enabled)
+  if not state.refills then state.refills={} end
+  local usesInventory=kind=='consumables' or kind=='bottles'
+  if enabled then
+    if not active() or state.scanning then error('Enable the trainer and wait for detection.') end
+    if usesInventory then
+      local inventory=state.inventory
+      if not inventory or not inventory.bool or (kind=='bottles' and not inventory.enum) then
+        error('The required inventory fields were not verified.')
+      end
+    elseif not refillTarget(kind) then error('This value could not be detected.') end
+    if state.refills[kind] then return end
+    if kind=='bottles' then
+      state.bottleFastmem=bottleFastmemBase(state.inventory)
+      if not state.bottleFastmem then error('The player bottle action state could not be verified.') end
+    end
+  end
+  state.refills[kind]=enabled or nil
+  if kind=='bottles' then
+    state.bottleContents=enabled and {} or nil
+    state.bottlePending=enabled and {} or nil
+    if enabled then refillBottles() end
+    if not enabled then state.bottleFastmem=nil end
+  elseif kind=='consumables' and enabled then refillConsumables() end
+  if not next(state.refills) then
+    if state.timer then state.timer.destroy(); state.timer=nil end
+    return
+  end
+  local interval=state.refills.bottles and 40 or 120
+  if state.timer then state.timer.Interval=interval; return end
+  state.timer=createTimer(nil)
+  state.timer.Interval=interval
+  state.timer.OnTimer=function()
+    if not active() then state.timer.destroy(); state.timer=nil; return end
+    for vital in pairs(state.refills) do
+      if vital=='consumables' then refillConsumables()
+      elseif vital=='bottles' then refillBottles()
+      else
+        local address,value,ceiling=refillTarget(vital)
+        if not address then
+          if state.refreshVital then state.refreshVital(vital) end
+        elseif value and ceiling and value&lt;ceiling and (vital~='hearts' or value&gt;0) then
+          writeInteger(address,ceiling)
+        end
+      end
+    end
+  end
+end
+state.setRefill=setRefill
+
+-- PouchTable lists these masks in the display order of its two equipment tiles.
+local MASK_SLOTS={
+  [1621]={title='Normal Mask Slot',ids={1116,1112,1117,1111,1110,1115,1114,1113}},
+  [1622]={title='Amiibo Mask Slot',ids={1108,1109,1169}},
+}
+local function maskInSlot(inventory,slot)
+  for _,id in ipairs(slot.ids) do
+    local stock=field(inventory.int,ITEM_DEFINITIONS[id][1])
+    if stock and u32(stock)==1 then return id end
+  end
+  return 0
+end
+local function chooseSlotMask(inventory,slot,list)
+  local owned=maskInSlot(inventory,slot)
+  local ids={0}
+  local form=createForm(false)
+  local ok,id=pcall(function()
+    form.Caption=slot.title
+    form.Position='poScreenCenter'
+    form.BorderStyle='bsDialog'
+    form.ClientWidth=330
+    form.ClientHeight=140
+    local label=createLabel(form)
+    label.Left=16; label.Top=14
+    label.Caption='Choose which mask appears in this inventory slot.'
+    local combo=createComboBox(form)
+    combo.Left=16; combo.Top=40; combo.Width=298
+    combo.Style='csDropDownList'
+    combo.Items.add('Empty')
+    local selected=0
+    for _,id in ipairs(slot.ids) do
+      if field(inventory.int,ITEM_DEFINITIONS[id][1]) then
+        combo.Items.add(list.getMemoryRecordByID(id).Description)
+        ids[#ids+1]=id
+        if id==owned then selected=#ids-1 end
+      end
+    end
+    combo.ItemIndex=selected
+    local apply=createButton(form)
+    apply.Caption='Apply'; apply.Left=145; apply.Top=86; apply.Default=true; apply.ModalResult=mrOK
+    local cancel=createButton(form)
+    cancel.Caption='Cancel'; cancel.Left=231; cancel.Top=86; cancel.Cancel=true; cancel.ModalResult=mrCancel
+    if form.showModal()==mrOK then return ids[combo.ItemIndex+1] end
+  end)
+  form.destroy()
+  if not ok then error(id) end
+  return id
+end
+local function replaceMaskSlot(inventory,slot,list)
+  local selected=chooseSlotMask(inventory,slot,list)
+  if selected==nil or not active() then return end
+  local equipped=field(inventory.string,0x59D9C7B3)
+  local wearing=field(inventory.bool,0xC27C80FB)
+  local oldActor=equipped and readString(equipped,64)
+  if not oldActor or not wearing then error('The worn mask fields could not be verified.') end
+  local changes={}
+  local selectedItem=ITEM_DEFINITIONS[selected]
+  if selectedItem then planAcquisition(changes,inventory,selectedItem) end
+  local replacesWornMask=false
+  for _,id in ipairs(slot.ids) do
+    local item=ITEM_DEFINITIONS[id]
+    local stock=field(inventory.int,item[1])
+    if stock then
+      local current=u32(stock)
+      if current~=0 and current~=1 then error('The mask stock could not be verified.') end
+      planWrite(changes,stock,4,id==selected and 1 or 0)
+    elseif id==selected or id~=1169 then
+      error('A mask required by this slot could not be verified.')
+    end
+    if item[4]==oldActor then replacesWornMask=true end
+  end
+  if replacesWornMask then
+    planWrite(changes,equipped,64,selectedItem and selectedItem[4] or '')
+    if not selectedItem then planWrite(changes,wearing,1,0) end
+  end
+  commitChanges(changes)
+end
+-- IsGet.Item_Melody flags, in the order shown in the song group.
+local SONG_FLAGS={
+  0x01C20002, 0xB492AC33, 0xD3F8BFCC, 0x165DD1AD,
+  0x03B3450E, 0x2B39DD4F, 0xDC0A0B54, 0x49041AB9,
+  0x3FA63986, 0xC2FB95F4, 0x802A36A8, 0xD6320BA4,
+}
+local function openInventory(root)
+  local inventory=readInventory(root)
+  if not inventory then log('INVENTORY: GameData integer layout not recognized.'); return end
+  state.inventory=inventory
+  registerSymbol('OoT_Inventory_A',root,true)
+  local majora=field(inventory.int,ITEM_DEFINITIONS[1169][1])
+  if majora and field(inventory.bool,ITEM_DEFINITIONS[1169][2]) and field(inventory.bool,ITEM_DEFINITIONS[1169][3]) then
+    registerSymbol('OoT_MajoraStock_A',majora,true)
+  end
+  for id,definition in pairs(BOTTLE_DEFINITIONS) do
+    local content=field(inventory.enum,definition[3])
+    if content then registerSymbol('OoT_BottleContent_'..id,content,true) end
+  end
+  local list=getAddressList()
+  local previous=list.OnValueChange
+  local bottleA=list.getMemoryRecordByID(1530)
+  local previousBottleDisplay=bottleA and bottleA.OnGetDisplayValue
+  if bottleA then
+    local definition=BOTTLE_DEFINITIONS[1530]
+    bottleA.OnGetDisplayValue=function(record,value)
+      if active() then
+        local stock=field(inventory.int,definition[1])
+        local validity=field(inventory.bool,definition[2])
+        local count=stock and ri(stock)
+        local valid=validity and rb(validity)
+        if count and count&gt;0 and valid==1 then return true,'Owned' end
+        if count==0 and valid==0 then return true,'Absent' end
+      end
+      if previousBottleDisplay then return previousBottleDisplay(record,value) end
+      return false
+    end
+  end
+  local songSymbols={}
+  for index,hash in ipairs(SONG_FLAGS) do
+    local address=field(inventory.bool,hash)
+    local value=address and rb(address)
+    if value==0 or value==1 then
+      local symbol='OoT_OcarinaSong_'..index
+      registerSymbol(symbol,address,true)
+      songSymbols[#songSymbols+1]=symbol
+    end
+  end
+  local slotRecords={}
+  for id,slot in pairs(MASK_SLOTS) do
+    local record=list.getMemoryRecordByID(id)
+    if record then
+      slotRecords[#slotRecords+1]=record
+      record.OnActivate=function(_,before) return not before end
+      record.OnGetDisplayValue=function()
+        if not active() then return false end
+        local id=maskInSlot(inventory,slot)
+        local item=id~=0 and list.getMemoryRecordByID(id)
+        return true,item and item.Description or 'Empty'
+      end
+    end
+  end
+  local function onValueChange(sender,record)
+    local item=ITEM_DEFINITIONS[record.ID]
+    local bottle=BOTTLE_DEFINITIONS[record.ID]
+    local maskSlot=MASK_SLOTS[record.ID]
+    if item or bottle or record.ID==1521 or maskSlot then
+      if not active() then return true end
+      local ok,err=pcall(function()
+        if record.ID==1521 then changeMagicMeter(inventory)
+        elseif maskSlot then replaceMaskSlot(inventory,maskSlot,list)
+        else changeOwnership(inventory,record,item or bottle,bottle~=nil) end
+      end)
+      if not ok then showMessage(tostring(err)) end
+      return true
+    end
+    local contentBottle=BOTTLE_DEFINITIONS[record.ID-10]
+    if contentBottle and record.ID&gt;=1540 and record.ID&lt;=1544 then
+      local stock=field(inventory.int,contentBottle[1])
+      local valid=field(inventory.bool,contentBottle[2])
+      if not active() or not stock or not valid or (u32(stock) or 0)==0 or rb(valid)~=1 then
+        showMessage('Unlock this bottle before editing its contents.')
+        return true
+      end
+    end
+    if previous then return previous(sender,record) end
+    return false
+  end
+  list.OnValueChange=onValueChange
+  state.closeInventory=function()
+    list.OnValueChange=previous
+    if bottleA then bottleA.OnGetDisplayValue=previousBottleDisplay end
+    for _,symbol in ipairs(songSymbols) do pcall(unregisterSymbol,symbol) end
+    for _,record in ipairs(slotRecords) do
+      record.OnActivate=nil
+      record.OnGetDisplayValue=nil
+    end
+  end
+  log(string.format('INVENTORY READY: integer fields found, acquisitions=%s bottles=%s equipped items=%s Majora=%s',
+    tostring(inventory.bool~=nil),tostring(inventory.enum~=nil),tostring(inventory.string~=nil),tostring(majora~=nil)))
+end
+
+local function registerSet(symbols,addresses)
+  for i,s in ipairs(symbols) do registerSymbol(s,addresses[i],true) end
+end
+local function setLuaWindowVisible(visible)
+  local ok,err=pcall(function()
+    local engine=getLuaEngine()
+    if engine then
+      if visible then engine.show() else engine.hide() end
+    end
+  end)
+  if not ok then log('Lua window visibility ERROR: '..tostring(err)) end
+end
+-- Run exactly one full-process AOB scan at a time, in a worker thread.
+-- Do not run the second scan until the first scan has finished and its results
+-- have been validated. This reduces simultaneous load on Lichii.
+local function runScan(kind,pattern,flags,limit,validator,symbols,addresses,onComplete,alignment)
+  local isHearts=symbols==HS
+  local isMagic=symbols==MS
+  local legacyHearts=validator==validLegacyHearts
+  local includeMapped=type(setSpecialScanOptionsOverride)=='function'
+  createThread(function(th)
+    local ok,res=pcall(function()
+      -- Fritchii exposes these GameData records in MEM_MAPPED regions. +W only
+      -- selects page protection and does not include those regions by itself.
+      if includeMapped then setSpecialScanOptionsOverride({MEM_MAPPED=true}) end
+      if alignment then return AOBScan(pattern,flags,1,alignment) end
+      return AOBScan(pattern,flags)
+    end)
+    if includeMapped then setSpecialScanOptionsOverride({}) end
+    local hits={}; local total=0; local parseErrors=0
+    if ok and res then
+      total=res.Count
+      if total&lt;=limit then
+        for i=0,total-1 do
+          local a=tonumber(res[i],16)
+          if a then hits[#hits+1]=a else parseErrors=parseErrors+1 end
+        end
+      end
+      res.destroy()
+    end
+    th.synchronize(function()
+      if not active() then return end
+      if not ok then
+        log(kind..' scan ERROR: '..tostring(res))
+        -- Final UI decision is made after both sequential scans.
+        if onComplete then onComplete('error') end
+        return
+      end
+      log(kind..' AOB hits='..total..' flags='..flags..(includeMapped and ' MEM_MAPPED included' or ''))
+      if isHearts then
+        local ref=_G.OoT_HeartReferenceAddress
+        if type(ref)=='string' then ref=tonumber(ref:gsub('^0[xX]',''),16) end
+        if type(ref)=='number' and ref&gt;0 then
+          local anchor=ref+(legacyHearts and 0xE0 or 4)
+          local present=false
+          for _,a in ipairs(hits) do if a==anchor then present=true; break end end
+          log(string.format('%s includes_reference_anchor=%s anchor=%X',kind,tostring(present),anchor))
+        end
+      end
+      if total&gt;limit or parseErrors&gt;0 then
+        log(kind..' result limit/parse failure; no addresses registered.')
+        -- Final UI decision is made after both sequential scans.
+        if onComplete then onComplete('error') end
+        return
+      end
+      local good={}
+      local rejects={ids=0,health=0,a0=0,c0=0,other=0}
+      for _,a in ipairs(hits) do
+        local c,reason=validator(a)
+        if c then good[#good+1]=c
+        else rejects[reason or 'other']=(rejects[reason or 'other'] or 0)+1 end
+      end
+      if legacyHearts then
+        log(string.format('HEARTS rejects ids=%d health=%d A0=%d C0=%d other=%d',rejects.ids,rejects.health,rejects.a0,rejects.c0,rejects.other))
+        local strict={}
+        for _,c in ipairs(good) do if c.strict then strict[#strict+1]=c end end
+        log('HEARTS strict='..#strict..' relaxed='..#good)
+        if #strict&gt;0 then good=strict end
+      end
+      log(kind..' structurally valid='..#good)
+      if #good==0 then
+        for reason,count in pairs(rejects) do
+          if count&gt;0 then log(string.format('%s rejected %d: %s',kind,count,reason)) end
+        end
+      end
+      local rupeeViews
+      if #good&gt;1 then
+        for i,c in ipairs(good) do
+          if isHearts then
+            log(string.format('%s candidate #%d hearts=%X values=%d/%d',kind,i,c.h,c.a,c.b))
+          elseif isMagic then
+            log(string.format('%s candidate #%d magic=%X value=%d',kind,i,c.m,c.value))
+          else
+            log(string.format('%s candidate #%d rupees=%X values=%d/%d wallet=%X capacities=%d/%d',kind,i,c.r,c.x,c.y,c.w,c.c,c.d))
+          end
+        end
+        local matchedRupees,backing
+        local addressKey=isHearts and 'h' or (isMagic and 'm' or 'r')
+        if (isHearts or isMagic) and state.rupeeViews then
+          local ok,candidate=pcall(vitalCandidateFromRupees,good,addressKey)
+          if ok and candidate then backing,matchedRupees=candidate,true end
+        end
+        if not backing then
+          local ok,candidate,views=pcall(physicalCandidate,good,addressKey)
+          if ok then backing,rupeeViews=candidate,views end
+        end
+        if backing then
+          local basis=matchedRupees and 'using the verified rupee allocations and offsets' or 'using mapped-page comparison'
+          log(string.format('%s: %d mapped views match the RAM backing at %X %s.',kind,#good,backing[addressKey],basis))
+          good={backing}
+        else
+          log(kind..': could not confirm that the candidates are mapped views of the same RAM.')
+        end
+      end
+      local status=#good==0 and 'absent' or 'ambiguous'
+      if #good==1 then
+        local c=good[1]
+        local okreg,err=pcall(registerSet,symbols,addresses(c))
+        if okreg then
+          status='ready'
+          if isMagic then
+            state.magicAddress=c.m
+            log(string.format('READY active magic=%X (%d)',c.m,c.value))
+          elseif not isHearts then
+            state.rupees=true
+            state.rupeeAddress=c.r
+            state.rupeeViews=rupeeViews
+            local inventoryOk,inventoryError=pcall(openInventory,c.r)
+            if not inventoryOk then log('INVENTORY ERROR: '..tostring(inventoryError)) end
+            log(string.format('READY rupees A=%X (%d) wallet A=%X (%d) scan=%s',c.r,c.x,c.w,c.c,kind))
+          else
+            state.hearts=true
+            state.heartAddress=c.h
+            state.legacyHearts=legacyHearts
+            local validation=legacyHearts and (c.strict and 'STRICT' or 'RELAXED') or 'HASHES'
+            log(string.format('READY current hearts=%X (%d) max hearts=%X (%d) validation=%s',c.h,c.a,c.h+0x10,c.b,validation))
+          end
+        else
+          status='error'
+          for _,sym in ipairs(symbols) do pcall(unregisterSymbol,sym) end
+          log(kind..' symbol registration ERROR: '..tostring(err))
+        end
+      else
+        log(kind..' '..status..': no addresses registered.')
+      end
+      -- Final UI decision is made after both sequential scans.
+      if onComplete then onComplete(status) end
+    end)
+  end)
+end
+local function finishAll()
+  if not active() then return end
+  state.scanning=false
+  log('COMPLETE rupees/wallet='..(state.rupees and 'READY' or 'UNAVAILABLE')..' hearts='..(state.hearts and 'READY' or 'UNAVAILABLE')..' magic='..(state.magicAddress and 'READY' or 'UNAVAILABLE'))
+  if state.rupees and state.hearts and state.magicAddress then setLuaWindowVisible(false)
+  else
+    if not state.hearts then
+      log('Load a playable save, then use Hearts Re-Detect to retry the read-only scan.')
+    end
+    log('Detection incomplete; Lua window shown for diagnostics.')
+    setLuaWindowVisible(true)
+  end
+end
+local function scanHearts(onComplete)
+  local function addresses(candidate) return {candidate.h,candidate.h+0x10} end
+  runScan('HEARTS RECORDS',HEART_RECORD_PATTERN,'+W',10000,validHeartRecord,HS,addresses,function(status)
+    if status=='absent' then
+      runScan('HEARTS LEGACY',HEART_LEGACY_PATTERN,'+W',10000,validLegacyHearts,HS,addresses,onComplete)
+    else
+      onComplete(status)
+    end
+  end,'4')
+end
+local function scanRupees(onComplete)
+  local function addresses(candidate) return {candidate.r,candidate.w} end
+  runScan('RUPEES RECORDS',RUPEE_RECORD_PATTERN,'+W',10000,validRupeeRecord,RS,addresses,function(status)
+    if status=='absent' then
+      runScan('RUPEES LEGACY',RUPEE_LEGACY_PATTERN,'+W-C',10000,validLegacyRupees,RS,addresses,onComplete,'4')
+    else
+      onComplete(status)
+    end
+  end,'4')
+end
+local function scanMagic(onComplete)
+  runScan('ACTIVE MAGIC',MAGIC_RECORD_PATTERN,'+W',10000,validActiveMagic,MS,function(c) return {c.m} end,onComplete,'4')
+end
+state.refreshVital=function(kind)
+  if state.scanning or kind=='rupees' then return end
+  local now=getTickCount()
+  if state.nextRefresh and now&lt;state.nextRefresh then return end
+  state.nextRefresh=now+10000
+  state.scanning=true
+  if kind=='magic' then
+    state.magicAddress=nil
+    pcall(unregisterSymbol,MS[1])
+    if activeHeartOwner() then scanMagic(finishAll); return end
+  end
+  state.hearts=false
+  state.heartAddress=nil
+  for _,symbol in ipairs(HS) do pcall(unregisterSymbol,symbol) end
+  scanHearts(function()
+    if not active() then return end
+    if kind=='magic' then scanMagic(finishAll) else finishAll() end
+  end)
+end
+local function retryHearts()
+  if not active() then log('RETRY refused: trainer inactive or process changed.'); return false end
+  if state.scanning then log('RETRY refused: scan already running.'); return false end
+  if state.hearts then log('RETRY skipped: hearts already detected.'); return true end
+  state.scanning=true
+  log('RETRY HEARTS: scanning loaded health records.')
+  scanHearts(finishAll)
+  return true
+end
+state.retryHearts=retryHearts
+_G.OoT_RetryHearts=function()
+  if _G.OoT_AOB_State~=state then return false end
+  return retryHearts()
+end
+log('ENABLE: scanning rupees, hearts and active magic; read-only.')
+state.scanning=true
+scanRupees(function()
+  if not active() then return end
+  scanHearts(function()
+    if active() then scanMagic(finishAll) end
+  end)
+end)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+if _G.OoT_AOB_State then
+  _G.OoT_AOB_State.cancelled=true
+  if _G.OoT_AOB_State.closeInventory then pcall(_G.OoT_AOB_State.closeInventory) end
+  if _G.OoT_AOB_State.timer then pcall(function() _G.OoT_AOB_State.timer.destroy() end) end
+end
+for _,s in ipairs({'OoT_Rupees_A','OoT_Wallet_A','OoT_Hearts_A','OoT_MaxHearts_A','OoT_ActiveMagic_A','OoT_Inventory_A','OoT_MajoraStock_A','OoT_BottleContent_1530','OoT_BottleContent_1531','OoT_BottleContent_1532','OoT_BottleContent_1533','OoT_BottleContent_1534'}) do pcall(unregisterSymbol,s) end
+_G.OoT_AOB_State=nil
+_G.OoT_RetryHearts=nil
+print('Disabled; all symbols unregistered. Game memory unchanged.')
+-- Always hide on manual disable: no detection error to report.
+local hideOk,hideErr=pcall(function()
+  local engine=getLuaEngine()
+  if engine then engine.hide() end
+end)
+if not hideOk then print('Lua window hide ERROR: '..tostring(hideErr)) end
+return ''
+{$asm}
+</AssemblerScript>
+      <Hotkeys>
+        <Hotkey>
+          <Action>Toggle Activation</Action>
+          <Keys>
+            <Key>96</Key>
+          </Keys>
+          <ID>0</ID>
+          <ActivateSound>Activate</ActivateSound>
+          <DeactivateSound>Deactivate</DeactivateSound>
+        </Hotkey>
+      </Hotkeys>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>1523</ID>
+          <Description>"Infinite Hearts (NUMPAD 1)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if not state or not state.setRefill then error('Enable the trainer and wait for heart detection.') end
+state.setRefill('hearts',true)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if state and state.setRefill then state.setRefill('hearts',false) end
+return ''
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>97</Key>
+              </Keys>
+              <ID>0</ID>
+              <ActivateSound>Activate</ActivateSound>
+              <DeactivateSound>Deactivate</DeactivateSound>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1522</ID>
+          <Description>"Infinite Magic (NUMPAD 2)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if not state or not state.setRefill then error('Enable the trainer and wait for active magic detection.') end
+state.setRefill('magic',true)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if state and state.setRefill then state.setRefill('magic',false) end
+return ''
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>98</Key>
+              </Keys>
+              <ID>0</ID>
+              <ActivateSound>Activate</ActivateSound>
+              <DeactivateSound>Deactivate</DeactivateSound>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1524</ID>
+          <Description>"Infinite Rupees (NUMPAD 3)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if not state or not state.setRefill then error('Enable the trainer and wait for rupee detection.') end
+state.setRefill('rupees',true)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if state and state.setRefill then state.setRefill('rupees',false) end
+return ''
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>99</Key>
+              </Keys>
+              <ID>0</ID>
+              <ActivateSound>Activate</ActivateSound>
+              <DeactivateSound>Deactivate</DeactivateSound>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1624</ID>
+          <Description>"Infinite Consumables (NUMPAD 4)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if not state or not state.setRefill then error('Enable the trainer and wait for inventory detection.') end
+state.setRefill('consumables',true)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if state and state.setRefill then state.setRefill('consumables',false) end
+return ''
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>100</Key>
+              </Keys>
+              <ID>0</ID>
+              <ActivateSound>Activate</ActivateSound>
+              <DeactivateSound>Deactivate</DeactivateSound>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1625</ID>
+          <Description>"Infinite Bottle Use (NUMPAD 5)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if not state or not state.setRefill then error('Enable the trainer and wait for inventory detection.') end
+state.setRefill('bottles',true)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if state and state.setRefill then state.setRefill('bottles',false) end
+return ''
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>101</Key>
+              </Keys>
+              <ID>0</ID>
+              <ActivateSound>Activate</ActivateSound>
+              <DeactivateSound>Deactivate</DeactivateSound>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1623</ID>
+          <Description>"Status"</Description>
+          <Options moHideChildren="1"/>
+          <GroupHeader>1</GroupHeader>
+          <CheatEntries>
+            <CheatEntry>
+              <ID>1506</ID>
+              <Description>"Pieces of Heart"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1130</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>5</ID>
+              <Description>"Current Hearts"</Description>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Hearts_A</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>6</ID>
+              <Description>" Hearts Pool"</Description>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_MaxHearts_A</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1520</ID>
+              <Description>"Current Magic (tenths of MP)"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_ActiveMagic_A</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1521</ID>
+              <Description>"Magic Meter (tenths of MP)"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+C8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1</ID>
+              <Description>"Current Rupees"</Description>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>3</ID>
+              <Description>"Wallet capacity"</Description>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Wallet_A</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>911</ID>
+              <Description>"Current Deku Nuts"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A+8E8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1501</ID>
+              <Description>"Max Deku Nuts"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1B8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>929</ID>
+              <Description>"Current Deku Sticks"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A+938</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1503</ID>
+              <Description>"Max Deku Sticks"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+208</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>926</ID>
+              <Description>"Current Deku Seeds"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A+910</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1502</ID>
+              <Description>"Max Deku Seeds"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1E0</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>903</ID>
+              <Description>"Current Bombs"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A+708</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>904</ID>
+              <Description>"Current Bombchu"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A+7A8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1500</ID>
+              <Description>"Max Bombs and Bombchus"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+190</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1504</ID>
+              <Description>"Magic Beans"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+AF0</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>915</ID>
+              <Description>"Current Arrows"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A+6E0</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>920</ID>
+              <Description>"Max Arrows"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A+168</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>923</ID>
+              <Description>"Business Scrub Seeds"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Rupees_A+ED8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1505</ID>
+              <Description>"Gold Skulltula Tokens"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1018</Address>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1606</ID>
+          <Description>"Inventory (double-click the value to unlock or remove)"</Description>
+          <Options moHideChildren="1"/>
+          <GroupHeader>1</GroupHeader>
+          <CheatEntries>
+            <CheatEntry>
+              <ID>1626</ID>
+              <Description>"Ocarina's songs"</Description>
+              <Options moHideChildren="1"/>
+              <GroupHeader>1</GroupHeader>
+              <CheatEntries>
+                <CheatEntry>
+                  <ID>1630</ID>
+                  <Description>"Zelda's Lullaby"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_1</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1631</ID>
+                  <Description>"Epona's Song"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_2</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1632</ID>
+                  <Description>"Saria's Song"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_3</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1633</ID>
+                  <Description>"Sun's Song"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_4</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1634</ID>
+                  <Description>"Song of Time"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_5</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1635</ID>
+                  <Description>"Song of Storms"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_6</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1636</ID>
+                  <Description>"Minuet of Forest"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_7</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1637</ID>
+                  <Description>"Bolero of Fire"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1638</ID>
+                  <Description>"Serenade of Water"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_9</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1639</ID>
+                  <Description>"Nocturne of Shadow"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_10</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1640</ID>
+                  <Description>"Requiem of Spirit"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_11</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1641</ID>
+                  <Description>"Prelude of Light"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Locked
+1:Unlocked
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>Byte</VariableType>
+                  <Address>OoT_OcarinaSong_12</Address>
+                </CheatEntry>
+              </CheatEntries>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1605</ID>
+              <Description>"Small Keys (Per dungeon - Still missing some)"</Description>
+              <Options moHideChildren="1"/>
+              <GroupHeader>1</GroupHeader>
+              <CheatEntries>
+                <CheatEntry>
+                  <ID>1510</ID>
+                  <Description>"Bottom of the Well"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-7A80</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1511</ID>
+                  <Description>"Forest Temple"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-78A0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1512</ID>
+                  <Description>"Fire Temple"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-7918</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1513</ID>
+                  <Description>"Water Temple"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-7468</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1514</ID>
+                  <Description>"Shadow Temple"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-7558</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1515</ID>
+                  <Description>"Spirit Temple"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-74E0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1516</ID>
+                  <Description>"Gerudo Fortress"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-7828</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1517</ID>
+                  <Description>"Gerudo Proving Grounds"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-77B0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1518</ID>
+                  <Description>"Ganondorf's Castle"</Description>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+-76C0</Address>
+                </CheatEntry>
+              </CheatEntries>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1602</ID>
+              <Description>"Tools and quest items"</Description>
+              <Options moHideChildren="1"/>
+              <GroupHeader>1</GroupHeader>
+              <CheatEntries>
+                <CheatEntry>
+                  <ID>1642</ID>
+                  <Description>"Quest Items"</Description>
+                  <Options moHideChildren="1"/>
+                  <GroupHeader>1</GroupHeader>
+                  <CheatEntries>
+                    <CheatEntry>
+                      <ID>1157</ID>
+                      <Description>"Zelda's Letter"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+10E0</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1148</ID>
+                      <Description>"Pocket Egg"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+DC0</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1147</ID>
+                      <Description>"Pocket Cucco"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+D98</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1156</ID>
+                      <Description>"Weird Egg"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+10B8</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1120</ID>
+                      <Description>"Wake-Up Cucco"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+640</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1127</ID>
+                      <Description>"Cojiro"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+8C0</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1144</ID>
+                      <Description>"Odd Mushroom"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+D20</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1145</ID>
+                      <Description>"Odd Poultice"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+D48</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1146</ID>
+                      <Description>"Poacher's Saw"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+D70</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1149</ID>
+                      <Description>"Prescription"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+DE8</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1130</ID>
+                      <Description>"Specialty Eye Drops"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+9B0</Address>
+                    </CheatEntry>
+                    <CheatEntry>
+                      <ID>1126</ID>
+                      <Description>"Biggoron Receipt"</Description>
+                      <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                      <ShowAsSigned>0</ShowAsSigned>
+                      <VariableType>4 Bytes</VariableType>
+                      <Address>OoT_Inventory_A+898</Address>
+                    </CheatEntry>
+                  </CheatEntries>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1124</ID>
+                  <Description>"Boomerang"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+7D0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1134</ID>
+                  <Description>"Longshot"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+AC8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1133</ID>
+                  <Description>"Hookshot"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+AA0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1121</ID>
+                  <Description>"Fire Arrow"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+668</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1122</ID>
+                  <Description>"Ice Arrow"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+690</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1123</ID>
+                  <Description>"Light Arrow"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+6B8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1125</ID>
+                  <Description>"Broken Goron Sword"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+7F8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1128</ID>
+                  <Description>"Din's Fire"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+960</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1129</ID>
+                  <Description>"Eyeball Frog"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+988</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1131</ID>
+                  <Description>"Farore's Wind"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+A50</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1132</ID>
+                  <Description>"Megaton Hammer"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+A78</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1141</ID>
+                  <Description>"Nayru's Love"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+C08</Address>
+                </CheatEntry>
+              </CheatEntries>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1603</ID>
+              <Description>"Key items and rewards"</Description>
+              <Options moHideChildren="1"/>
+              <GroupHeader>1</GroupHeader>
+              <CheatEntries>
+                <CheatEntry>
+                  <ID>1153</ID>
+                  <Description>"Kokiri Emerald"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+FA0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1152</ID>
+                  <Description>"Goron Ruby"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+F78</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1154</ID>
+                  <Description>"Zora Sapphire"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+FC8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1142</ID>
+                  <Description>"Fairy Ocarina"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+CD0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1143</ID>
+                  <Description>"Ocarina of Time"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+CF8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1107</ID>
+                  <Description>"Goron Bracelet"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+370</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1151</ID>
+                  <Description>"Silver Scale"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+EB0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1150</ID>
+                  <Description>"Golden Scale"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+E88</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1101</ID>
+                  <Description>"Silver Gauntlets"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+280</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1100</ID>
+                  <Description>"Golden Gauntlets"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+258</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1137</ID>
+                  <Description>"Light Medallion"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+B68</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1136</ID>
+                  <Description>"Forest Medallion"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+B40</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1135</ID>
+                  <Description>"Fire Medallion"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+B18</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1140</ID>
+                  <Description>"Water Medallion"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+BE0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1138</ID>
+                  <Description>"Shadow Medallion"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+B90</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1139</ID>
+                  <Description>"Spirit Medallion"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+BB8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1155</ID>
+                  <Description>"Gerudo Pass"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+FF0</Address>
+                </CheatEntry>
+              </CheatEntries>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1607</ID>
+              <Description>"Bottles"</Description>
+              <Options moHideChildren="1"/>
+              <GroupHeader>1</GroupHeader>
+              <CheatEntries>
+                <CheatEntry>
+                  <ID>1530</ID>
+                  <Description>"Bottle A"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+550</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1540</ID>
+                  <Description>"Bottle A Content"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">3194609225:Empty
+3938082919:Red Potion
+77412289:Green Potion
+4085503717:Blue Potion
+472462615:Blue Fire
+511921912:Fish
+254076936:Letter
+3452048497:Big Poe
+34099102:Poe
+1960193739:Bug
+1867113303:Fairy
+1932879911:Milk
+4009157808:Half Milk
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_BottleContent_1530</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1531</ID>
+                  <Description>"Bottle B"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+578</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1541</ID>
+                  <Description>"Bottle B Content"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">3194609225:Empty
+3938082919:Red Potion
+77412289:Green Potion
+4085503717:Blue Potion
+472462615:Blue Fire
+511921912:Fish
+254076936:Letter
+3452048497:Big Poe
+34099102:Poe
+1960193739:Bug
+1867113303:Fairy
+1932879911:Milk
+4009157808:Half Milk
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_BottleContent_1531</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1532</ID>
+                  <Description>"Bottle C"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+5A0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1542</ID>
+                  <Description>"Bottle C Content"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">3194609225:Empty
+3938082919:Red Potion
+77412289:Green Potion
+4085503717:Blue Potion
+472462615:Blue Fire
+511921912:Fish
+254076936:Letter
+3452048497:Big Poe
+34099102:Poe
+1960193739:Bug
+1867113303:Fairy
+1932879911:Milk
+4009157808:Half Milk
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_BottleContent_1532</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1533</ID>
+                  <Description>"Bottle D"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+5C8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1543</ID>
+                  <Description>"Bottle D Content"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">3194609225:Empty
+3938082919:Red Potion
+77412289:Green Potion
+4085503717:Blue Potion
+472462615:Blue Fire
+511921912:Fish
+254076936:Letter
+3452048497:Big Poe
+34099102:Poe
+1960193739:Bug
+1867113303:Fairy
+1932879911:Milk
+4009157808:Half Milk
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_BottleContent_1533</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1534</ID>
+                  <Description>"Bottle E"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+5F0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1544</ID>
+                  <Description>"Bottle E Content"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">3194609225:Empty
+3938082919:Red Potion
+77412289:Green Potion
+4085503717:Blue Potion
+472462615:Blue Fire
+511921912:Fish
+254076936:Letter
+3452048497:Big Poe
+34099102:Poe
+1960193739:Bug
+1867113303:Fairy
+1932879911:Milk
+4009157808:Half Milk
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_BottleContent_1534</Address>
+                </CheatEntry>
+              </CheatEntries>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1608</ID>
+              <Description>"Upgrade stocks (capacity set separately)"</Description>
+              <Options moHideChildren="1"/>
+              <GroupHeader>1</GroupHeader>
+              <CheatEntries>
+                <CheatEntry>
+                  <ID>1565</ID>
+                  <Description>"Deku-Seed Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+870</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1564</ID>
+                  <Description>"Bigger Deku-Seed Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+848</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1563</ID>
+                  <Description>"Biggest Deku-Seed Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+820</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1575</ID>
+                  <Description>"Deku-Stick Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+F50</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1574</ID>
+                  <Description>"Bigger Deku-Stick Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+F28</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1573</ID>
+                  <Description>"Biggest Deku-Stick Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+F00</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1569</ID>
+                  <Description>"Deku-Nut Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+CA8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1568</ID>
+                  <Description>"Bigger Deku-Nut Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+C80</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1567</ID>
+                  <Description>"Biggest Deku-Nut Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+C58</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1562</ID>
+                  <Description>"Bomb Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+780</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1561</ID>
+                  <Description>"Bigger Bomb Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+758</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1560</ID>
+                  <Description>"Biggest Bomb Bag"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+730</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1566</ID>
+                  <Description>"Gift of Halved Damage"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+9D8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1572</ID>
+                  <Description>"Quiver"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+E60</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1571</ID>
+                  <Description>"Bigger Quiver"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+E38</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1570</ID>
+                  <Description>"Biggest Quiver"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+E10</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1578</ID>
+                  <Description>"Kokiri Wallet"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+1090</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1577</ID>
+                  <Description>"Adult's Wallet"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+1068</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1576</ID>
+                  <Description>"Giant's Wallet"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+1040</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1580</ID>
+                  <Description>"Bow + Fire Arrow"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+1180</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1581</ID>
+                  <Description>"Bow + Ice Arrow"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+11A8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1582</ID>
+                  <Description>"Bow + Light Arrow"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+11D0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1579</ID>
+                  <Description>"amiibo"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+1158</Address>
+                </CheatEntry>
+              </CheatEntries>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1620</ID>
+          <Description>"Inventory Mask Slots (double-click a value)"</Description>
+          <Options moHideChildren="1"/>
+          <GroupHeader>1</GroupHeader>
+          <CheatEntries>
+            <CheatEntry>
+              <ID>1621</ID>
+              <Description>"Normal Mask Slot"</Description>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+3E8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1622</ID>
+              <Description>"Amiibo Mask Slot"</Description>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+3C0</Address>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1601</ID>
+          <Description>"Equipment and Masks"</Description>
+          <Options moHideChildren="1"/>
+          <GroupHeader>1</GroupHeader>
+          <CheatEntries>
+            <CheatEntry>
+              <ID>1609</ID>
+              <Description>"Masks"</Description>
+              <Options moHideChildren="1"/>
+              <GroupHeader>1</GroupHeader>
+              <CheatEntries>
+                <CheatEntry>
+                  <ID>1110</ID>
+                  <Description>"Bunny Hood"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+3E8</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1111</ID>
+                  <Description>"Gerudo Mask"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+410</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1112</ID>
+                  <Description>"Goron Mask"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+438</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1117</ID>
+                  <Description>"Zora Mask"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+500</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1113</ID>
+                  <Description>"Keaton Mask"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+460</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1114</ID>
+                  <Description>"Skull Mask"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+488</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1115</ID>
+                  <Description>"Spooky Mask"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+4B0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1116</ID>
+                  <Description>"Mask of Truth"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+4D8</Address>
+                </CheatEntry>
+              </CheatEntries>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1610</ID>
+              <Description>"Amiibo Masks"</Description>
+              <Options moHideChildren="1"/>
+              <GroupHeader>1</GroupHeader>
+              <CheatEntries>
+                <CheatEntry>
+                  <ID>1108</ID>
+                  <Description>"Fairy-Kid Mask"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+398</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1109</ID>
+                  <Description>"Princess Mask"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+3C0</Address>
+                </CheatEntry>
+                <CheatEntry>
+                  <ID>1169</ID>
+                  <Description>"Majora's Mask (mod required)"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_MajoraStock_A</Address>
+                </CheatEntry>
+              </CheatEntries>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1158</ID>
+              <Description>"Kokiri Tunic (Default Clild Clothes)"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1108</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1105</ID>
+              <Description>"Hero's Clothes (Default Adult Clothes)"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+320</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1102</ID>
+              <Description>"Goron Tunic"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+2A8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1106</ID>
+              <Description>"Zora Tunic"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+348</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1119</ID>
+              <Description>"Echo Gem"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+618</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1167</ID>
+              <Description>"Kokiri Sword"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1338</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1168</ID>
+              <Description>"Master Sword"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1360</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1165</ID>
+              <Description>"Broken Giant's Knife"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+12E8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1166</ID>
+              <Description>"Giant's Knife"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1310</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1164</ID>
+              <Description>"Biggoron Sword"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+12C0</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1161</ID>
+              <Description>"Deku Shield"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1248</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1162</ID>
+              <Description>"Hylian Shield"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1270</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1163</ID>
+              <Description>"Mirror Shield"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1298</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1160</ID>
+              <Description>"Fairy Slingshot"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+1220</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1159</ID>
+              <Description>"Fairy Bow"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+11F8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1103</ID>
+              <Description>"Iron Boots"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+2D0</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1104</ID>
+              <Description>"Hover Boots"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+2F8</Address>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>1118</ID>
+              <Description>"Lenses of Truth"</Description>
+              <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>OoT_Inventory_A+528</Address>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+      </CheatEntries>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+</CheatTable>
