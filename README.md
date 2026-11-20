@@ -3,7 +3,7 @@ This Cheat Engine table lets you modify Link's resources, inventory, and equipme
 
 ## Tested Configuration
 
-All options in version **1.3** have been tested in-game and confirmed working with **Emulator**. Majora's Mask was tested with version **1.0.2** of its mod.
+All options have been tested in-game and confirmed working with **Emulator**. Majora's Mask was tested with version **1.0.2** of its mod.
 
 ## How to Use
 
