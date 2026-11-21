@@ -34,6 +34,7 @@ local function cleanup()
     _G.OoT_AOB_State.cancelled=true
     if _G.OoT_AOB_State.closeInventory then pcall(_G.OoT_AOB_State.closeInventory) end
     if _G.OoT_AOB_State.timer then pcall(function() _G.OoT_AOB_State.timer.destroy() end) end
+    if _G.OoT_AOB_State.setInfiniteJump then pcall(_G.OoT_AOB_State.setInfiniteJump,false) end
   end
   for _,s in ipairs(RS) do pcall(unregisterSymbol,s) end
   for _,s in ipairs(inventorySymbols) do pcall(unregisterSymbol,s) end
@@ -657,7 +658,7 @@ local function bottleActionReady(fastmem)
   -- actor's attachment returns only once the native action has finished.
   return (primary &amp; 0x80)==0 and (secondary &amp; 0x40)==0 and attachment~=0
 end
-local function bottleFastmemBase(inventory)
+local function resolveFastmemBase(inventory,validate)
   local views=state.rupeeViews
   local head=field(inventory.string,0x59D9C7B3)
   local weapon=field(inventory.string,0xA95A3521)
@@ -669,7 +670,7 @@ local function bottleFastmemBase(inventory)
       local h,w=readQword(aliasHead-0x0C),readQword(aliasWeapon-0x0C)
       if h and w and h&gt;0 and w&gt;0 then
         local base=aliasHead-h
-        if base&gt;0 and base%0x10000==0 and base==aliasWeapon-w and bottleActionReady(base)~=nil then
+        if base&gt;0 and base%0x10000==0 and base==aliasWeapon-w and (not validate or validate(base)~=nil) then
           return base
         end
       end
@@ -754,7 +755,7 @@ local function setRefill(kind,enabled)
     elseif not refillTarget(kind) then error('This value could not be detected.') end
     if state.refills[kind] then return end
     if kind=='bottles' then
-      state.bottleFastmem=bottleFastmemBase(state.inventory)
+      state.bottleFastmem=resolveFastmemBase(state.inventory,bottleActionReady)
       if not state.bottleFastmem then error('The player bottle action state could not be verified.') end
     end
   end
@@ -790,6 +791,116 @@ local function setRefill(kind,enabled)
   end
 end
 state.setRefill=setRefill
+
+
+
+-- 1.1.1, E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348.
+local JUMP_TEXT_OFFSET, JUMP_CAVE_OFFSET=0x3C46160,0x3C46E8C
+local JUMP_SLOT_OFFSET, JUMP_ORIGINAL_OFFSET=0x4B04B48,0x7F5260
+local JUMP_TEXT_PATTERN='D0 83 00 F0 11 3E 41 F9 10 E2 09 91 20 02 1F D6 D0 83 00 F0 11 42 41 F9 10 02 0A 91 20 02 1F D6 D0 83 00 F0 11 46 41 F9 10 22 0A 91 20 02 1F D6'
+local function hexBytes(s)
+  local bytes={}
+  for byte in s:gmatch('%x%x') do bytes[#bytes+1]=tonumber(byte,16) end
+  return bytes
+end
+local JUMP_TEXT_BYTES=hexBytes(JUMP_TEXT_PATTERN)
+local JUMP_ORIGINAL_BYTES=hexBytes('7F 23 03 D5 FD 7B BD A9 F5 0B 00 F9 F4 4F 02 A9 FD 03 00 91 08 04 40 F9')
+local JUMP_PREDICATE_BYTES=hexBytes('7F 23 03 D5 FD 7B BD A9 F5 0B 00 F9 F4 4F 02 A9 FD 03 00 91 14 38 41 F9')
+-- AArch64 trampoline for SelectorPlayerSchedulerJump. It reads Link's
+-- airborne state and the game's one-frame Jump action, calls the stock
+-- eligibility check, then calls the character controller's Jump request.
+-- On every path it tail-calls the original scheduler. No HID buttons are read.
+local JUMP_HOOK=hexBytes([[
+F3 53 BE A9 FE 0B 00 F9 F3 03 00 AA 08 04 40 F9
+08 05 40 F9 08 03 00 B4 14 F9 40 F9 88 3A 41 F9
+A8 02 00 B4 09 AD 41 F9 2A 2D 40 B9 4A 02 40 36
+2A 21 40 F9 4A 01 40 B9 EA 01 00 36 E0 03 14 AA
+E1 03 1F 2A F0 D1 2E 97 60 01 00 36 88 3A 41 F9
+08 29 40 F9 08 11 40 F9 08 09 40 F9 08 05 40 F9
+00 19 40 F9 08 00 40 F9 08 31 40 F9 21 00 80 52
+00 01 3F D6 E0 03 13 AA FE 0B 40 F9 F3 53 C2 A8
+D5 B8 2E 17
+]])
+local JUMP_EMPTY={}
+for i=1,#JUMP_HOOK do JUMP_EMPTY[i]=0 end
+
+local function jumpModule(fastmem)
+  local owner=activeHeartOwner()
+  local vtable=owner and readQword(fastmem+owner)
+  local main=vtable and vtable-0x4B25E18
+  if not main or main&lt;0x80000000 or main&gt;=0x100000000 or main%0x1000~=0 then return nil end
+  local host=fastmem+main
+  if block(host+JUMP_ORIGINAL_OFFSET,JUMP_ORIGINAL_BYTES) and
+      block(host+0x7FB690,JUMP_PREDICATE_BYTES) and block(host+JUMP_TEXT_OFFSET,JUMP_TEXT_BYTES) then
+    return main
+  end
+end
+
+local function writableJumpCave(allocation)
+  local region=getMemoryRegionInfo(allocation)
+  if not region or region.AllocationBase~=allocation or region.RegionSize&lt;0x1000 then return nil end
+  local scanner=createMemScan()
+  local found
+  local ok,cave=pcall(function()
+    setSpecialScanOptionsOverride({MEM_MAPPED=true,MEM_PRIVATE=false,MEM_IMAGE=false})
+    scanner.firstScan(soExactValue,vtByteArray,rtRounded,JUMP_TEXT_PATTERN,'',allocation,
+      allocation+0x380000000-1,'+W',fsmLastDigits,'160',true,false,false,false)
+    scanner.waitTillDone()
+    found=createFoundList(scanner)
+    found.initialize()
+    if found.Count~=1 then return nil end
+    return getAddressSafe(found.Address[0])+JUMP_CAVE_OFFSET-JUMP_TEXT_OFFSET
+  end)
+  if found then found.destroy() end
+  scanner.destroy()
+  setSpecialScanOptionsOverride({})
+  if ok and cave and mappedAllocation(cave)==allocation then return cave end
+end
+
+local function setInfiniteJump(enabled)
+  if not enabled then
+    local patch=state.jumpPatch
+    if not patch then return end
+    if getOpenedProcessID()==state.pid and readQword(patch.slot)==patch.hook then
+      if not writeQword(patch.slot,patch.original) or readQword(patch.slot)~=patch.original then
+        error('Could not restore the native jump scheduler.')
+      end
+    end
+    state.jumpPatch=nil
+    return
+  end
+  if state.jumpPatch then return end
+  if not active() or state.scanning or not state.inventory or not state.rupeeViews then
+    error('Enable the trainer and wait for detection.')
+  end
+  local fastmem=resolveFastmemBase(state.inventory,function(base) return jumpModule(base) end)
+  local main=fastmem and jumpModule(fastmem)
+  if not main then error('The native jump code for this game build could not be verified.') end
+  local slot=fastmem+main+JUMP_SLOT_OFFSET
+  local original=main+JUMP_ORIGINAL_OFFSET
+  local hook=main+JUMP_CAVE_OFFSET
+  local code=fastmem+hook
+  if readQword(slot)~=original then error('The native jump scheduler is already modified.') end
+  if not block(code,JUMP_HOOK) then
+    if not block(code,JUMP_EMPTY) then error('The native jump code space is occupied by another mod.') end
+    local cave=writableJumpCave(state.rupeeViews.allocation)
+    if not cave or not active() or readQword(slot)~=original or not block(code,JUMP_EMPTY) or
+        not block(cave,JUMP_EMPTY) then error('The writable view of the native jump code could not be verified.') end
+    writeBytes(cave,JUMP_HOOK)
+    if not block(code,JUMP_HOOK) then
+      writeBytes(cave,JUMP_EMPTY)
+      error('The emulator did not expose the native jump code in both memory views.')
+    end
+  end
+  -- Repointing this slot selects a new guest code address. Keep the unused
+  -- trampoline available after disable for a call already in flight.
+  if not writeQword(slot,hook) or readQword(slot)~=hook then
+    if readQword(slot)==hook then writeQword(slot,original) end
+    error('Could not enable the native jump scheduler.')
+  end
+  state.jumpPatch={slot=slot,original=original,hook=hook}
+end
+state.setInfiniteJump=setInfiniteJump
 
 -- PouchTable lists these masks in the display order of its two equipment tiles.
 local MASK_SLOTS={
@@ -1206,6 +1317,7 @@ if _G.OoT_AOB_State then
   _G.OoT_AOB_State.cancelled=true
   if _G.OoT_AOB_State.closeInventory then pcall(_G.OoT_AOB_State.closeInventory) end
   if _G.OoT_AOB_State.timer then pcall(function() _G.OoT_AOB_State.timer.destroy() end) end
+  if _G.OoT_AOB_State.setInfiniteJump then pcall(_G.OoT_AOB_State.setInfiniteJump,false) end
 end
 for _,s in ipairs({'OoT_Rupees_A','OoT_Wallet_A','OoT_Hearts_A','OoT_MaxHearts_A','OoT_ActiveMagic_A','OoT_Inventory_A','OoT_MajoraStock_A','OoT_BottleContent_1530','OoT_BottleContent_1531','OoT_BottleContent_1532','OoT_BottleContent_1533','OoT_BottleContent_1534'}) do pcall(unregisterSymbol,s) end
 _G.OoT_AOB_State=nil
@@ -1385,6 +1497,38 @@ return ''
               <Action>Toggle Activation</Action>
               <Keys>
                 <Key>101</Key>
+              </Keys>
+              <ID>0</ID>
+              <ActivateSound>Activate</ActivateSound>
+              <DeactivateSound>Deactivate</DeactivateSound>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1643</ID>
+          <Description>"Infinite Jump (NUMPAD +)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if not state or not state.setInfiniteJump then error('Enable the trainer and wait for detection.') end
+state.setInfiniteJump(true)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if state and state.setInfiniteJump then state.setInfiniteJump(false) end
+return ''
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>107</Key>
               </Keys>
               <ID>0</ID>
               <ActivateSound>Activate</ActivateSound>
@@ -2111,6 +2255,16 @@ return ''
                   <Address>OoT_Inventory_A+258</Address>
                 </CheatEntry>
                 <CheatEntry>
+                  <ID>1155</ID>
+                  <Description>"Gerudo Pass"</Description>
+                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
+1:Owned
+</DropDownList>
+                  <ShowAsSigned>0</ShowAsSigned>
+                  <VariableType>4 Bytes</VariableType>
+                  <Address>OoT_Inventory_A+FF0</Address>
+                </CheatEntry>
+                <CheatEntry>
                   <ID>1137</ID>
                   <Description>"Light Medallion"</Description>
                   <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
@@ -2169,16 +2323,6 @@ return ''
                   <ShowAsSigned>0</ShowAsSigned>
                   <VariableType>4 Bytes</VariableType>
                   <Address>OoT_Inventory_A+BB8</Address>
-                </CheatEntry>
-                <CheatEntry>
-                  <ID>1155</ID>
-                  <Description>"Gerudo Pass"</Description>
-                  <DropDownList ReadOnly="1" DescriptionOnly="1" DisplayValueAsItem="1">0:Absent
-1:Owned
-</DropDownList>
-                  <ShowAsSigned>0</ShowAsSigned>
-                  <VariableType>4 Bytes</VariableType>
-                  <Address>OoT_Inventory_A+FF0</Address>
                 </CheatEntry>
               </CheatEntries>
             </CheatEntry>
