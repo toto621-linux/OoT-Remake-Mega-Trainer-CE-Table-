@@ -29,8 +29,15 @@ local inventorySymbols={'OoT_Inventory_A','OoT_MajoraStock_A','OoT_BottleContent
 local HS={'OoT_Hearts_A','OoT_MaxHearts_A'}
 local MS={'OoT_ActiveMagic_A'}
 local function log(s) print(s) end
+local function restoreGrappleCheats(state)
+  if state.setGrappleCheat then
+    state.setGrappleCheat('range',false)
+    state.setGrappleCheat('surfaces',false)
+  end
+end
 local function cleanup()
   if _G.OoT_AOB_State then
+    restoreGrappleCheats(_G.OoT_AOB_State)
     _G.OoT_AOB_State.cancelled=true
     if _G.OoT_AOB_State.closeInventory then pcall(_G.OoT_AOB_State.closeInventory) end
     if _G.OoT_AOB_State.timer then pcall(function() _G.OoT_AOB_State.timer.destroy() end) end
@@ -824,7 +831,7 @@ D5 B8 2E 17
 local JUMP_EMPTY={}
 for i=1,#JUMP_HOOK do JUMP_EMPTY[i]=0 end
 
-local function jumpModule(fastmem)
+local function nativeGameModule(fastmem)
   local owner=activeHeartOwner()
   local vtable=owner and readQword(fastmem+owner)
   local main=vtable and vtable-0x4B25E18
@@ -845,7 +852,7 @@ local FRITCHII_CACHE_EPOCH=0x1044
 local FRITCHII_INVALIDATE_BYTES=hexBytes('56 57 53 48 83 EC 20 4C 89 C6 48 89 D7 48 89 CB 48 8B 49 40 48 85 C9 74 0C 48 8B 01 48 89 FA 49 89 F0 FF 50 38')
 local FRITCHII_ARM_INVALIDATE_BYTES=hexBytes('56 57 53 48 83 EC 20 4C 89 C6 48 89 D7 48 89 CB F0 FF 81 44 10 00 00 48 8B 89 C0 10 00 00')
 
-local function scanJumpBacking(pattern,alignmentType,alignment,accept)
+local function scanGuestBacking(pattern,alignmentType,alignment,accept)
   local allocation=state.rupeeViews.allocation
   local scanner=createMemScan()
   local found
@@ -872,11 +879,11 @@ local function scanJumpBacking(pattern,alignmentType,alignment,accept)
   if ok then return match end
 end
 
-local function jumpJitContext(fastmem,main)
+local function nativeJitContext(fastmem,main)
   local module=getAddressSafe('fritchii.exe')
   if not module or not block(module+FRITCHII_INVALIDATE,FRITCHII_INVALIDATE_BYTES) or
       not block(module+FRITCHII_ARM_INVALIDATE,FRITCHII_ARM_INVALIDATE_BYTES) then
-    error('Native Infinite Jump requires the verified Fritchii v6.2 Windows build.')
+    error('Native code patches require the verified Fritchii v6.2 Windows build.')
   end
   local processVtable=module+FRITCHII_KPROCESS_VTABLE
   local armVtable=module+FRITCHII_ARM_VTABLE
@@ -902,24 +909,24 @@ local function jumpJitContext(fastmem,main)
   if not cores then
     local bytes={}
     for i=0,7 do bytes[i+1]=string.format('%02X',(processVtable &gt;&gt; (i*8)) &amp; 0xFF) end
-    process=scanJumpBacking(table.concat(bytes,' '),fsmAligned,'8',matchingProcess)
+    process=scanGuestBacking(table.concat(bytes,' '),fsmAligned,'8',matchingProcess)
     cores=process and matchingProcess(process)
   end
   if not cores then error('The active emulated game process could not be verified.') end
   return module+FRITCHII_INVALIDATE,process,cores
 end
 
-local function flushJumpTranslations(invalidate,process,cores,guestAddress)
+local function flushNativeTranslations(invalidate,process,cores,guestAddress,size)
   local epochs={}
   for i,core in ipairs(cores) do
     epochs[i]=u32(core+FRITCHII_CACHE_EPOCH)
     if epochs[i]==nil then error('Could not read the emulator CPU cache state.') end
   end
   executeCodeEx(0,3000,invalidate,{type=0,value=process},
-    {type=0,value=guestAddress},{type=0,value=#JUMP_HOOK})
+    {type=0,value=guestAddress},{type=0,value=size})
   for i,core in ipairs(cores) do
     local epoch=u32(core+FRITCHII_CACHE_EPOCH)
-    if not epoch or epoch==epochs[i] then error('Fritchii did not invalidate the jump code on every CPU core.') end
+    if not epoch or epoch==epochs[i] then error('Fritchii did not invalidate the guest code on every CPU core.') end
   end
   -- Dynarmic interrupts running cores so they can drop the queued translations.
   sleep(150)
@@ -941,18 +948,18 @@ local function setInfiniteJump(enabled)
   if not active() or state.scanning or not state.inventory or not state.rupeeViews then
     error('Enable the trainer and wait for detection.')
   end
-  local fastmem=resolveFastmemBase(state.inventory,function(base) return jumpModule(base) end)
-  local main=fastmem and jumpModule(fastmem)
+  local fastmem=resolveFastmemBase(state.inventory,function(base) return nativeGameModule(base) end)
+  local main=fastmem and nativeGameModule(fastmem)
   if not main then error('The native jump code for this game build could not be verified.') end
   local slot=fastmem+main+JUMP_SLOT_OFFSET
   local original=main+JUMP_ORIGINAL_OFFSET
   local hook=main+JUMP_CAVE_OFFSET
   local code=fastmem+hook
   if readQword(slot)~=original then error('The native jump scheduler is already modified.') end
-  local invalidate,process,cores=jumpJitContext(fastmem,main)
+  local invalidate,process,cores=nativeJitContext(fastmem,main)
   if not block(code,JUMP_HOOK) then
     if not block(code,JUMP_EMPTY) then error('The native jump code space is occupied by another mod.') end
-    local anchor=scanJumpBacking(JUMP_TEXT_PATTERN,fsmLastDigits,'160',function(address)
+    local anchor=scanGuestBacking(JUMP_TEXT_PATTERN,fsmLastDigits,'160',function(address)
       return block(address+JUMP_CAVE_OFFSET-JUMP_TEXT_OFFSET,JUMP_EMPTY)
     end)
     local cave=anchor and anchor+JUMP_CAVE_OFFSET-JUMP_TEXT_OFFSET
@@ -965,7 +972,7 @@ local function setInfiniteJump(enabled)
       error('The emulator did not expose the native jump code in both memory views.')
     end
   end
-  flushJumpTranslations(invalidate,process,cores,hook)
+  flushNativeTranslations(invalidate,process,cores,hook,#JUMP_HOOK)
   if not active() or readQword(slot)~=original or not block(code,JUMP_HOOK) then
     error('The game changed while enabling Infinite Jump.')
   end
@@ -977,6 +984,139 @@ local function setInfiniteJump(enabled)
   state.jumpPatch={slot=slot,original=original,hook=hook}
 end
 state.setInfiniteJump=setInfiniteJump
+
+
+-- Hookshot and Longshot share the collision and range code on this build.
+local GRAPPLE_CAVE=0x3C46FB8
+local GRAPPLE_STUB=hexBytes('00 00 40 BD 00 28 20 1E 08 0C C3 17')
+local GRAPPLE_PATCHES={
+  surfaces={
+    -- Treat any ray hit with a surface as eligible in the aim result.
+    {offset=0x304017C,before=0xB6600139,after=0xD503201F,
+      lead=12,pattern='E8 C3 43 39 48 01 00 36 F9 77 40 F9 39 01 60 B6 E8 03 44 39 1F 05 00 71 21 2E 00 54'},
+    -- Accept the contact in the two hook-specific latch paths.
+    {offset=0x3043EEC,before=0x97FFC7A9,after=0x52800020,
+      lead=8,pattern='48 01 08 37 E0 03 15 AA A9 C7 FF 97 28 D3 40 79 1F 00 00 72'},
+    {offset=0x3044538,before=0x97FFC616,after=0x52800020,
+      lead=8,pattern='96 00 00 35 60 62 01 91 16 C6 FF 97 20 18 00 37 60 06 40 2D'},
+  },
+  range={
+    -- HookshotParam.Range: ldr s0,[x0]; fadd s0,s0,s0; branch to the original epilogue.
+    {offset=0x2D09FF8,before=0xBD400000,after=0x143CF3F0,
+      lead=20,pattern='FD 7B C2 A8 FF 0F 5F D6 E0 03 13 AA 34 09 8C 97 5B 00 00 94 00 00 40 BD F9 FF FF 17'},
+  },
+}
+local GRAPPLE_CAVE_CONTEXT=hexBytes('E8 03 1F 2A C0 03 5F D6 00 00 00 00')
+local GRAPPLE_EMPTY=hexBytes('00 00 00 00 00 00 00 00 00 00 00 00')
+local grappleActive={}
+local function getGrappleContext(sites)
+  if not active() or state.scanning or not state.inventory or not state.rupeeViews then
+    error('Enable the trainer and wait for detection.')
+  end
+  local fastmem=resolveFastmemBase(state.inventory,nativeGameModule)
+  local main=fastmem and nativeGameModule(fastmem)
+  if not main then error('The native grapple code for this game build could not be verified.') end
+  local host=fastmem+main
+  local backing=state.grappleBacking
+  if not backing or not block(backing+JUMP_TEXT_OFFSET,JUMP_TEXT_BYTES) then
+    local anchor=scanGuestBacking(JUMP_TEXT_PATTERN,fsmLastDigits,'160',function(address)
+      return block(address+GRAPPLE_CAVE-12-JUMP_TEXT_OFFSET,GRAPPLE_CAVE_CONTEXT)
+    end)
+    backing=anchor and anchor-JUMP_TEXT_OFFSET
+    if not backing then error('The writable view of the game code could not be verified.') end
+    state.grappleBacking=backing
+  end
+  local invalidate,process,cores=nativeJitContext(fastmem,main)
+  local writable={}
+  for _,site in ipairs(sites) do
+    local offset=site.offset-site.lead
+    local expected=hexBytes(site.pattern)
+    if not block(host+offset,expected) then
+      error(string.format('Unexpected grapple code at main+%X. Check for an overlapping mod.',site.offset))
+    end
+    local target=backing+offset
+    -- The host fastmem view is contiguous even when its RAM pages are not.
+    if mappedAllocation(target)~=state.rupeeViews.allocation or not block(target,expected) then
+      target=scanGuestBacking(site.pattern,fsmLastDigits,string.format('%03X',offset%0x1000),function()
+        return true
+      end)
+      if not target then error(string.format('Could not find the writable page for main+%X.',site.offset)) end
+    end
+    writable[site.offset]=target+site.lead
+  end
+  return {host=host,backing=backing,main=main,writable=writable,invalidate=invalidate,process=process,cores=cores}
+end
+local function patchGrappleCode(context,sites,enabled)
+  local function matches(site,code)
+    return u32(context.host+site.offset)==code and u32(context.writable[site.offset])==code
+  end
+  local function flush()
+    local first,last=sites[1].offset,sites[#sites].offset+4
+    flushNativeTranslations(context.invalidate,context.process,context.cores,context.main+first,last-first)
+  end
+  local from,to='before','after'
+  if not enabled then from,to=to,from end
+  for _,site in ipairs(sites) do
+    if mappedAllocation(context.writable[site.offset])~=state.rupeeViews.allocation or
+        not matches(site,site[from]) then
+      error(string.format('Unexpected grapple code at main+%X. Check for an overlapping mod.',site.offset))
+    end
+  end
+  local touched={}
+  local ok,err=pcall(function()
+    for _,site in ipairs(sites) do
+      touched[#touched+1]=site
+      writeInteger(context.writable[site.offset],site[to])
+      if not matches(site,site[to]) then error('Could not write the grapple patch in both memory views.') end
+    end
+    flush()
+  end)
+  if ok then return end
+  local rollbackOk,rollbackError=pcall(function()
+    for _,site in ipairs(touched) do
+      if matches(site,site[to]) then writeInteger(context.writable[site.offset],site[from]) end
+      if not matches(site,site[from]) then error('Could not roll back the grapple patch.') end
+    end
+    flush()
+  end)
+  if not rollbackOk then error(tostring(err)..' '..tostring(rollbackError)) end
+  error(err)
+end
+local function prepareGrappleRange(context)
+  local host,backing=context.host,context.backing
+  if not block(host+GRAPPLE_CAVE-12,GRAPPLE_CAVE_CONTEXT) or
+      not block(backing+GRAPPLE_CAVE-12,GRAPPLE_CAVE_CONTEXT) or
+      mappedAllocation(backing+GRAPPLE_CAVE)~=state.rupeeViews.allocation then
+    error('The Hookshot range function or its trampoline space could not be verified.')
+  end
+  if not block(host+GRAPPLE_CAVE,GRAPPLE_STUB) then
+    if not block(host+GRAPPLE_CAVE,GRAPPLE_EMPTY) or not block(backing+GRAPPLE_CAVE,GRAPPLE_EMPTY) then
+      error('The Hookshot range trampoline space is occupied.')
+    end
+    writeBytes(backing+GRAPPLE_CAVE,GRAPPLE_STUB)
+    if not block(host+GRAPPLE_CAVE,GRAPPLE_STUB) or not block(backing+GRAPPLE_CAVE,GRAPPLE_STUB) then
+      error('Could not write the Hookshot range trampoline.')
+    end
+  end
+  flushNativeTranslations(context.invalidate,context.process,context.cores,
+    context.main+GRAPPLE_CAVE,#GRAPPLE_STUB)
+end
+state.setGrappleCheat=function(name,enabled)
+  local previous=grappleActive[name]
+  if enabled then
+    if previous then return end
+    local context=getGrappleContext(GRAPPLE_PATCHES[name])
+    if name=='range' then prepareGrappleRange(context) end
+    patchGrappleCode(context,GRAPPLE_PATCHES[name],true)
+    grappleActive[name]=context
+  elseif previous then
+    if getOpenedProcessID()==state.pid and block(previous.host+JUMP_TEXT_OFFSET,JUMP_TEXT_BYTES) then
+      patchGrappleCode(previous,GRAPPLE_PATCHES[name],false)
+    end
+    -- Leave the range trampoline available for any call already in flight.
+    grappleActive[name]=nil
+  end
+end
 
 -- PouchTable lists these masks in the display order of its two equipment tiles.
 local MASK_SLOTS={
@@ -1390,6 +1530,10 @@ return ''
 {$lua}
 if syntaxcheck then return '' end
 if _G.OoT_AOB_State then
+  if _G.OoT_AOB_State.setGrappleCheat then
+    _G.OoT_AOB_State.setGrappleCheat('range',false)
+    _G.OoT_AOB_State.setGrappleCheat('surfaces',false)
+  end
   _G.OoT_AOB_State.cancelled=true
   if _G.OoT_AOB_State.closeInventory then pcall(_G.OoT_AOB_State.closeInventory) end
   if _G.OoT_AOB_State.timer then pcall(function() _G.OoT_AOB_State.timer.destroy() end) end
@@ -1573,6 +1717,70 @@ return ''
               <Action>Toggle Activation</Action>
               <Keys>
                 <Key>101</Key>
+              </Keys>
+              <ID>0</ID>
+              <ActivateSound>Activate</ActivateSound>
+              <DeactivateSound>Deactivate</DeactivateSound>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1645</ID>
+          <Description>"Hookshot / Longshot work on Any Surface (NUMPAD 6)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if not state or not state.setGrappleCheat then error('Enable the trainer and wait for detection.') end
+state.setGrappleCheat('surfaces',true)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if state and state.setGrappleCheat then state.setGrappleCheat('surfaces',false) end
+return ''
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>102</Key>
+              </Keys>
+              <ID>0</ID>
+              <ActivateSound>Activate</ActivateSound>
+              <DeactivateSound>Deactivate</DeactivateSound>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>1646</ID>
+          <Description>"Hookshot / Longshot Double Range (NUMPAD 7)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if not state or not state.setGrappleCheat then error('Enable the trainer and wait for detection.') end
+state.setGrappleCheat('range',true)
+return ''
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return '' end
+local state=_G.OoT_AOB_State
+if state and state.setGrappleCheat then state.setGrappleCheat('range',false) end
+return ''
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>103</Key>
               </Keys>
               <ID>0</ID>
               <ActivateSound>Activate</ActivateSound>
