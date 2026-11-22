@@ -836,25 +836,93 @@ local function jumpModule(fastmem)
   end
 end
 
-local function writableJumpCave(allocation)
-  local region=getMemoryRegionInfo(allocation)
-  if not region or region.AllocationBase~=allocation or region.RegionSize&lt;0x1000 then return nil end
+-- Fritchii v6.2 Windows x64, PE/PDB build 39C2D99A-83B6-EAF7-4C4C-44205044422E.
+local FRITCHII_INVALIDATE=0x19E9140
+local FRITCHII_KPROCESS_VTABLE=0x25999F8
+local FRITCHII_ARM_VTABLE=0x2AE0788
+local FRITCHII_ARM_INVALIDATE=0x192FF10
+local FRITCHII_CACHE_EPOCH=0x1044
+local FRITCHII_INVALIDATE_BYTES=hexBytes('56 57 53 48 83 EC 20 4C 89 C6 48 89 D7 48 89 CB 48 8B 49 40 48 85 C9 74 0C 48 8B 01 48 89 FA 49 89 F0 FF 50 38')
+local FRITCHII_ARM_INVALIDATE_BYTES=hexBytes('56 57 53 48 83 EC 20 4C 89 C6 48 89 D7 48 89 CB F0 FF 81 44 10 00 00 48 8B 89 C0 10 00 00')
+
+local function scanJumpBacking(pattern,alignmentType,alignment,accept)
+  local allocation=state.rupeeViews.allocation
   local scanner=createMemScan()
   local found
-  local ok,cave=pcall(function()
+  local ok,match=pcall(function()
     setSpecialScanOptionsOverride({MEM_MAPPED=true,MEM_PRIVATE=false,MEM_IMAGE=false})
-    scanner.firstScan(soExactValue,vtByteArray,rtRounded,JUMP_TEXT_PATTERN,'',allocation,
-      allocation+0x380000000-1,'+W',fsmLastDigits,'160',true,false,false,false)
+    scanner.firstScan(soExactValue,vtByteArray,rtRounded,pattern,'',allocation,
+      allocation+0x380000000-1,'+W',alignmentType,alignment,true,false,false,false)
     scanner.waitTillDone()
     found=createFoundList(scanner)
     found.initialize()
-    if found.Count~=1 then return nil end
-    return getAddressSafe(found.Address[0])+JUMP_CAVE_OFFSET-JUMP_TEXT_OFFSET
+    local selected
+    for i=0,found.Count-1 do
+      local address=getAddressSafe(found.Address[i])
+      if address and mappedAllocation(address)==allocation and accept(address) then
+        if selected then return nil end
+        selected=address
+      end
+    end
+    return selected
   end)
   if found then found.destroy() end
   scanner.destroy()
   setSpecialScanOptionsOverride({})
-  if ok and cave and mappedAllocation(cave)==allocation then return cave end
+  if ok then return match end
+end
+
+local function jumpJitContext(fastmem,main)
+  local module=getAddressSafe('fritchii.exe')
+  if not module or not block(module+FRITCHII_INVALIDATE,FRITCHII_INVALIDATE_BYTES) or
+      not block(module+FRITCHII_ARM_INVALIDATE,FRITCHII_ARM_INVALIDATE_BYTES) then
+    error('Native Infinite Jump requires the verified Fritchii v6.2 Windows build.')
+  end
+  local processVtable=module+FRITCHII_KPROCESS_VTABLE
+  local armVtable=module+FRITCHII_ARM_VTABLE
+  if readQword(armVtable+0x38)~=module+FRITCHII_ARM_INVALIDATE then
+    error('Fritchii CPU cache layout could not be verified.')
+  end
+  local function matchingProcess(address)
+    if readQword(address)~=processVtable or
+        readQword(address+0x2D48)~=0x0400486024DEC000 or
+        readQword(address+0x2BF0)~=fastmem or readQword(address+0x2D70)~=main then return nil end
+    local cores={}
+    for offset=0x40,0x68,8 do
+      local core=readQword(address+offset)
+      if not core or core==0 or readQword(core)~=armVtable then return nil end
+      cores[#cores+1]=core
+    end
+    return cores
+  end
+
+  -- The process object normally sits in the kernel slab near the beginning of RAM.
+  local process=state.rupeeViews.allocation+0x1C8000
+  local cores=matchingProcess(process)
+  if not cores then
+    local bytes={}
+    for i=0,7 do bytes[i+1]=string.format('%02X',(processVtable &gt;&gt; (i*8)) &amp; 0xFF) end
+    process=scanJumpBacking(table.concat(bytes,' '),fsmAligned,'8',matchingProcess)
+    cores=process and matchingProcess(process)
+  end
+  if not cores then error('The active emulated game process could not be verified.') end
+  return module+FRITCHII_INVALIDATE,process,cores
+end
+
+local function flushJumpTranslations(invalidate,process,cores,guestAddress)
+  local epochs={}
+  for i,core in ipairs(cores) do
+    epochs[i]=u32(core+FRITCHII_CACHE_EPOCH)
+    if epochs[i]==nil then error('Could not read the emulator CPU cache state.') end
+  end
+  executeCodeEx(0,3000,invalidate,{type=0,value=process},
+    {type=0,value=guestAddress},{type=0,value=#JUMP_HOOK})
+  for i,core in ipairs(cores) do
+    local epoch=u32(core+FRITCHII_CACHE_EPOCH)
+    if not epoch or epoch==epochs[i] then error('Fritchii did not invalidate the jump code on every CPU core.') end
+  end
+  -- Dynarmic interrupts running cores so they can drop the queued translations.
+  sleep(150)
 end
 
 local function setInfiniteJump(enabled)
@@ -881,19 +949,27 @@ local function setInfiniteJump(enabled)
   local hook=main+JUMP_CAVE_OFFSET
   local code=fastmem+hook
   if readQword(slot)~=original then error('The native jump scheduler is already modified.') end
+  local invalidate,process,cores=jumpJitContext(fastmem,main)
   if not block(code,JUMP_HOOK) then
     if not block(code,JUMP_EMPTY) then error('The native jump code space is occupied by another mod.') end
-    local cave=writableJumpCave(state.rupeeViews.allocation)
-    if not cave or not active() or readQword(slot)~=original or not block(code,JUMP_EMPTY) or
-        not block(cave,JUMP_EMPTY) then error('The writable view of the native jump code could not be verified.') end
+    local anchor=scanJumpBacking(JUMP_TEXT_PATTERN,fsmLastDigits,'160',function(address)
+      return block(address+JUMP_CAVE_OFFSET-JUMP_TEXT_OFFSET,JUMP_EMPTY)
+    end)
+    local cave=anchor and anchor+JUMP_CAVE_OFFSET-JUMP_TEXT_OFFSET
+    if not cave or not active() or readQword(slot)~=original or not block(code,JUMP_EMPTY) then
+      error('The writable view of the native jump code could not be verified.')
+    end
     writeBytes(cave,JUMP_HOOK)
     if not block(code,JUMP_HOOK) then
       writeBytes(cave,JUMP_EMPTY)
       error('The emulator did not expose the native jump code in both memory views.')
     end
   end
-  -- Repointing this slot selects a new guest code address. Keep the unused
-  -- trampoline available after disable for a call already in flight.
+  flushJumpTranslations(invalidate,process,cores,hook)
+  if not active() or readQword(slot)~=original or not block(code,JUMP_HOOK) then
+    error('The game changed while enabling Infinite Jump.')
+  end
+  -- Keep the trampoline available after disable for a call already in flight.
   if not writeQword(slot,hook) or readQword(slot)~=hook then
     if readQword(slot)==hook then writeQword(slot,original) end
     error('Could not enable the native jump scheduler.')
