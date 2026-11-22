@@ -20,6 +20,8 @@ All options have been tested in-game and confirmed working with **Emulator**. Ma
 | Numpad 3 | **Infinite Rupees** | Refills the wallet up to its current capacity. |
 | Numpad 4 | **Infinite Consumables** | Replenishes Deku Seeds, arrows, bombs, Bombchus, Deku Nuts, Pest Nuts, Magic Beans, and Deku Sticks. Each consumable must be unlocked, with at least one remaining. |
 | Numpad 5 | **Infinite Bottle Use** | Restores the contents after Link finishes putting the bottle away. A bottle that was initially empty remains empty. |
+| Numpad 6 | **Hookshot/Longshot work on any surface** | Allow Hookshot/Longshot to hook on any surface. |
+| Numpad 7 | **Hookshot/Longshot Double Range** | Double chain length for both. |
 | Numpad + | **Infinite Jumps** | Link can jump as many times as you want without touching the ground. |
 
 ## Status and Inventory
