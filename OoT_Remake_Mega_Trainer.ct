@@ -502,6 +502,7 @@ local function readInventory(root)
   local inventory={root=root,int={first=first,tag=tag,stride=0x28,valueOffset=0x1C,indices=indices}}
   inventory.bool=findRecords(root,tag-0xC0,-0x68000,-0x56000,0x18,0x16,
     hasMajora and 11305 or 11292,0x7AE38E5B,0x2337)
+  inventory.float=findRecords(root,tag+0xC0,0x18000,0x1A000,0x28,0x1C,89,0x61466C21,71)
   inventory.enum=findRecords(root,tag+0x180,0x15000,0x20000,0x38,0x1C,130,0x7D48DF76,60)
   inventory.string=findRecords(root,tag+0x540,0x22000,0x30000,0x108,0x74,54,0xA95A3521,23)
   return inventory
@@ -551,21 +552,150 @@ local function commitChanges(changes)
   if not restored then error(tostring(err)..' The rollback could not be verified.') end
   error(err)
 end
-local function planAcquisition(changes,inventory,definition)
-  planWrite(changes,field(inventory.bool,definition[2]),1,1)
-  planWrite(changes,field(inventory.bool,definition[3]),1,1)
+
+-- The first value is live. The second is the corresponding GameData copy.
+-- Leave the default value and record metadata untouched.
+local function planStored(changes,records,hash,size,value)
+  local address=field(records,hash)
+  planWrite(changes,address,size,value)
+  local copyOffset=size==1 and 1 or (size==64 and 0x50 or 4)
+  planWrite(changes,address+copyOffset,size,value)
+end
+local function planAcquisition(changes,inventory,definition,value)
+  for i=2,3 do planStored(changes,inventory.bool,definition[i],1,value or 1) end
 end
 local function checkUnequipped(inventory,actor)
   if actor=='Armor_Adult_Normal' or actor=='Obj_Armor_Child_Normal' then
     error('The default tunic cannot be removed.')
   end
-  if not actor:match('^Weapon_Sword_') and not actor:match('^Weapon_Shield_') then return end
-  for _,hash in ipairs({0xA95A3521,0xEE463235,0xA1F7EE2B,0x2342B619}) do
+  local equippedFields={0xA95A3521,0xEE463235,0xA1F7EE2B,0x2342B619,0x008D7F0C}
+  if actor:match('^Armor_Child_Mask_') or actor=='Armor_GlassTruth' then
+    local address=field(inventory.bool,0xC27C80FB)
+    local wearing=address and rb(address)
+    if wearing==nil then error('The worn mask could not be checked.') end
+    if wearing==1 then equippedFields[#equippedFields+1]=0x59D9C7B3 end
+  end
+  for _,hash in ipairs(equippedFields) do
     local address=field(inventory.string,hash)
     local equipped=address and readString(address,64)
-    if equipped==nil then error('The equipment for both eras could not be checked.') end
-    if equipped==actor then error('Unequip this item in both eras before removing it.') end
+    if equipped==nil then error('The equipped items for both eras could not be checked.') end
+    if equipped==actor then error('Unequip this item before removing it.') end
   end
+end
+
+-- Capacity tiers and active bag names come from the save editor's catalog.
+local CAPACITY_GROUPS={
+  {limit=0xE0010A50, name=0x3E42AFFA, base=99, ids={1578,1577,1576}, limits={200,500,1000}, stocks={0xA77921D7}},
+  {limit=0xAE8CC742, name=0xD732DD7F, ids={1565,1564,1563}, limits={30,40,50}, stocks={0x5FADF7FC}, launcher=1160, acquired=0x29888E1E},
+  {limit=0x735B00F7, name=0x0DA3A7A7, ids={1569,1568,1567}, limits={20,30,40}, stocks={0xF30D9F54}},
+  {limit=0x457616B0, name=0x2808EE1C, ids={1575,1574,1573}, limits={10,20,30}, stocks={0xB9494411}},
+  {limit=0xE753508B, ids={1562,1561,1560}, limits={20,30,40}, stocks={0xDB1BCD4F,0xDF7C517A}},
+  {limit=0x418DB791, ids={1572,1571,1570}, limits={30,40,50}, stocks={0x518EC74B}, launcher=1159, acquired=0x572701EA},
+}
+local function itemStock(inventory,id)
+  local address=field(inventory.int,ITEM_DEFINITIONS[id][1])
+  local stock=address and u32(address)
+  if stock~=0 and stock~=1 then error('The item stock could not be verified.') end
+  return stock
+end
+local function planCapacity(changes,inventory,group,id,nextStock,tier)
+  local selected
+  for level,other in ipairs(group.ids) do
+    local stock=other==id and nextStock or itemStock(inventory,other)
+    -- Acquiring an upgrade also registers the earlier tiers, like the save editor.
+    if nextStock==1 and tier and level&lt;tier and stock==0 then
+      local definition=ITEM_DEFINITIONS[other]
+      planAcquisition(changes,inventory,definition)
+      planStored(changes,inventory.int,definition[1],4,1)
+      stock=1
+    end
+    if stock==1 then selected=level end
+  end
+  local newLauncher=id==group.launcher and nextStock==1
+  if newLauncher and not selected then
+    selected=1
+    local definition=ITEM_DEFINITIONS[group.ids[1]]
+    planAcquisition(changes,inventory,definition)
+    planStored(changes,inventory.int,definition[1],4,1)
+  end
+  local limit=selected and group.limits[selected] or group.base or 0
+  local oldLimitAddress=field(inventory.int,group.limit)
+  local oldLimit=oldLimitAddress and u32(oldLimitAddress)
+  planStored(changes,inventory.int,group.limit,4,limit)
+  if group.name then
+    local name=selected and ITEM_DEFINITIONS[group.ids[selected]][4] or ''
+    planStored(changes,inventory.string,group.name,64,name)
+  end
+  for _,hash in ipairs(group.stocks) do
+    local address=field(inventory.int,hash)
+    local value=address and u32(address)
+    if not value then error('The quantity associated with this upgrade could not be verified.') end
+    if newLauncher and oldLimit==0 and value==0 then
+      planStored(changes,inventory.bool,group.acquired,1,1)
+      planStored(changes,inventory.int,hash,4,limit)
+    elseif value&gt;limit then
+      planStored(changes,inventory.int,hash,4,limit)
+    end
+  end
+end
+
+local DIVE_DEPTH=0x61466C21
+local function planItemEffect(changes,inventory,id,nextStock)
+  if id==1150 or id==1151 then
+    local gold=id==1150 and nextStock or itemStock(inventory,1150)
+    local silver=id==1151 and nextStock or itemStock(inventory,1151)
+    -- PlayerStatus.DiveDepth is a Float with verified native tiers 3/6/9.
+    local depth=gold==1 and 0x41100000 or (silver==1 and 0x40C00000 or 0x40400000)
+    planStored(changes,inventory.float,DIVE_DEPTH,4,depth)
+  elseif id==1142 or id==1143 then
+    local fairy=id==1142 and nextStock or itemStock(inventory,1142)
+    local time=id==1143 and nextStock or itemStock(inventory,1143)
+    local actor=time==1 and 'Item_Ocarina_Time' or (fairy==1 and 'Item_Ocarina_Fairy' or '')
+    planStored(changes,inventory.string,0xB72CD3FC,64,actor)
+  elseif id==1566 then
+    planStored(changes,inventory.bool,0x56BBE07C,1,nextStock) -- PlayerStatus.IsDefenseUP
+  elseif id==1166 and nextStock==1 then
+    local life=field(inventory.int,0xBDF672C2)
+    if itemStock(inventory,id)==0 or (life and u32(life)==0) then
+      planStored(changes,inventory.int,0xBDF672C2,4,8)
+    end
+  else
+    for _,group in ipairs(CAPACITY_GROUPS) do
+      for level,other in ipairs(group.ids) do
+        if id==other then planCapacity(changes,inventory,group,id,nextStock,level); return end
+      end
+      if id==group.launcher and nextStock==1 then
+        planCapacity(changes,inventory,group,id,nextStock)
+        return
+      end
+    end
+  end
+end
+
+local function planOwnership(inventory,id,definition,bottle,nextStock)
+  local changes={}
+  if bottle then
+    planStored(changes,inventory.enum,definition[3],4,0xBE69DE49)
+    planStored(changes,inventory.bool,definition[2],1,nextStock)
+    -- IsGet.Item_Bottle and its related flag are shared by all five slots.
+    local anyBottle=nextStock==1
+    for other,slot in pairs(BOTTLE_DEFINITIONS) do
+      if other~=id then
+        local address=field(inventory.int,slot[1])
+        local stock=address and u32(address)
+        if not stock then error('The other bottle slots could not be checked.') end
+        anyBottle=anyBottle or stock&gt;0
+      end
+    end
+    for _,hash in ipairs({0x1106B082,0xB62ED4EC}) do
+      planStored(changes,inventory.bool,hash,1,anyBottle and 1 or 0)
+    end
+  else
+    planAcquisition(changes,inventory,definition,nextStock)
+    planItemEffect(changes,inventory,id,nextStock)
+  end
+  planStored(changes,inventory.int,definition[1],4,nextStock)
+  return changes
 end
 local function changeOwnership(inventory,record,definition,bottle)
   local address=field(inventory.int,definition[1])
@@ -573,25 +703,29 @@ local function changeOwnership(inventory,record,definition,bottle)
   if old==nil or (not bottle and old~=0 and old~=1) then error('The item stock could not be verified.') end
   local owned=old&gt;0
   local nextStock=owned and 0 or 1
-  local changes={}
+  if owned and not bottle and #planOwnership(inventory,record.ID,definition,false,1)&gt;0 then
+    local answer=messageDialog(record.Description..' has incomplete ownership or upgrade data.\\nYes repairs it. No removes it.',
+      mtConfirmation,mbYes,mbNo,mbCancel)
+    if answer~=mrYes and answer~=mrNo then return end
+    nextStock=answer==mrYes and 1 or 0
+  else
+    local question=(owned and 'Remove ' or 'Unlock ')..record.Description..'?'
+    if bottle and owned then question=question..'\\nThis also empties the bottle.' end
+    if owned and record.ID&gt;=1560 and record.ID&lt;=1578 and record.ID~=1566 then
+      question=question..'\\nQuantities above a reduced capacity will be lowered.'
+    end
+    if messageDialog(question,mtConfirmation,mbYes,mbNo)~=mrYes then return end
+  end
+  if not active() or state.scanning or state.inventory~=inventory then return end
+  if u32(address)~=old then error('The item changed before the edit could be applied.') end
   if bottle then
     local valid=field(inventory.bool,definition[2])
-    local content=field(inventory.enum,definition[3])
-    if not valid or not content or rb(valid)~=(owned and 1 or 0) then error('The bottle ownership fields could not be verified.') end
-    planWrite(changes,content,4,0xBE69DE49)
-    planWrite(changes,valid,1,nextStock)
-  elseif not owned then
-    planAcquisition(changes,inventory,definition)
-  else
-    checkUnequipped(inventory,definition[4])
-  end
-  planWrite(changes,address,4,nextStock)
-  local question=(owned and 'Remove ' or 'Unlock ')..record.Description..'?'
-  if bottle and owned then question=question..'\nThis also empties the bottle.' end
-  if messageDialog(question,mtConfirmation,mbYes,mbNo)==mrYes and active() then
-    commitChanges(changes)
-    if bottle and state.bottleContents then state.bottleContents[record.ID]=nil end
-    if bottle and state.bottlePending then state.bottlePending[record.ID]=nil end
+    if not valid or rb(valid)~=(owned and 1 or 0) then error('The bottle ownership fields could not be verified.') end
+  elseif nextStock==0 then checkUnequipped(inventory,definition[4]) end
+  commitChanges(planOwnership(inventory,record.ID,definition,bottle,nextStock))
+  if bottle and state.bottleContents then
+    state.bottleContents[record.ID]=nil
+    state.bottlePending[record.ID]=nil
   end
 end
 local function changeMagicMeter(inventory)
@@ -604,13 +738,13 @@ local function changeMagicMeter(inventory)
   if (mp~=24 and mp~=48) or mp*10&lt;before then error('Choose the current magic tier or an upgrade.') end
   local changes={}
   planAcquisition(changes,inventory,MAGIC_BLESSINGS[1])
-  planWrite(changes,field(inventory.int,MAGIC_BLESSINGS[1][1]),4,1)
+  planStored(changes,inventory.int,MAGIC_BLESSINGS[1][1],4,1)
   if mp==48 then
     planAcquisition(changes,inventory,MAGIC_BLESSINGS[2])
-    planWrite(changes,field(inventory.int,MAGIC_BLESSINGS[2][1]),4,1)
+    planStored(changes,inventory.int,MAGIC_BLESSINGS[2][1],4,1)
   end
-  planWrite(changes,maximum,4,mp*10)
-  planWrite(changes,field(inventory.int,0x76B18200),4,mp*10)
+  planStored(changes,inventory.int,0x12D63A97,4,mp*10)
+  planStored(changes,inventory.int,0x76B18200,4,mp*10)
   if state.magicAddress and validActiveMagic(state.magicAddress-0x0C) then
     planWrite(changes,state.magicAddress,4,mp*10)
   end
@@ -653,17 +787,14 @@ local BOTTLE_CONTENTS={
   [0xCDC21471]=true, [0x02084F9E]=true, [0x74D62ECB]=true, -- Big Poe, Poe, Bug
   [0x6F49E357]=true, [FULL_MILK]=true, [HALF_MILK]=true, -- Fairy and Milk
 }
-local function bottleActionReady(fastmem)
-  local owner=activeHeartOwner()
-  if not owner then return nil end
+
+local nativeGameModule
+local function bottleActionReady(fastmem,owner)
+  if not fastmem or not owner then return nil end
   local actor=fastmem+owner
   local primary,secondary=u32(actor+0x4AC),u32(actor+0xC54)
-  if not primary or not secondary or (secondary &amp; 0xFFFF0000)~=0x01FF0000 then return nil end
-  local ok,attachment=pcall(readQword,actor+0x1990)
-  if not ok or attachment==nil then return nil end
-  -- These action flags remain set after the bottle becomes empty. The
-  -- actor's attachment returns only once the native action has finished.
-  return (primary &amp; 0x80)==0 and (secondary &amp; 0x40)==0 and attachment~=0
+  if not primary or not secondary or secondary &amp; 0xFFFF0000~=0x01FF0000 then return nil end
+  return primary &amp; 0x80==0 and secondary &amp; 0x40==0
 end
 local function resolveFastmemBase(inventory,validate)
   local views=state.rupeeViews
@@ -684,14 +815,32 @@ local function resolveFastmemBase(inventory,validate)
     end
   end
 end
+
+local function forgetBottleActions()
+  state.bottleContents={}
+  state.bottlePending={}
+  state.bottleLastBusy=nil
+end
 local function refillBottles()
   local inventory=state.inventory
-  local remembered=state.bottleContents
-  local pending=state.bottlePending
-  if not inventory or not remembered or not pending then return end
-  local ready=bottleActionReady(state.bottleFastmem)
+  if not inventory or state.scanning then return end
+  local owner=activeHeartOwner()
+  -- Rebind the guest actor after a scene change or a save load. Its vtable
+  -- verifies the fastmem mapping before any action flags are trusted.
+  if owner~=state.bottleOwner or not state.bottleFastmem then
+    forgetBottleActions()
+    state.bottleOwner=owner
+    state.bottleFastmem=owner and resolveFastmemBase(inventory,nativeGameModule)
+  end
+  local ready=bottleActionReady(state.bottleFastmem,owner)
+  if ready==nil then
+    forgetBottleActions()
+    if not owner and state.refreshVital then state.refreshVital('hearts') end
+    return
+  end
+  local remembered,pending=state.bottleContents,state.bottlePending
   local now=getTickCount()
-  if ready==nil and not activeHeartOwner() and state.refreshVital then state.refreshVital('hearts') end
+  if not ready then state.bottleLastBusy=now end
   for id,definition in pairs(BOTTLE_DEFINITIONS) do
     local stock=field(inventory.int,definition[1])
     local valid=field(inventory.bool,definition[2])
@@ -701,24 +850,32 @@ local function refillBottles()
       local previous=remembered[id]
       if previous and (value==EMPTY_BOTTLE or (previous==FULL_MILK and value==HALF_MILK)) then
         local refill=pending[id]
-        if not refill or refill.after~=value then
-          refill={after=value,since=now}
+        if not refill and state.bottleLastBusy and now-state.bottleLastBusy&lt;=250 then
+          refill={before=previous,after=value,since=now}
           pending[id]=refill
         end
-        if ready then
+        if not refill or refill.after~=value then
+          remembered[id]=BOTTLE_CONTENTS[value] and value or nil
+          pending[id]=nil
+        elseif not ready then
+          refill.readySince=nil
+        else
           refill.readySince=refill.readySince or now
           if now-refill.since&gt;=2500 and now-refill.readySince&gt;=120 and
-             u32(content)==value and rb(valid)==1 and (ri(stock) or 0)&gt;0 and bottleActionReady(state.bottleFastmem) then
-            writeInteger(content,previous)
+              u32(content)==value and rb(valid)==1 and (ri(stock) or 0)&gt;0 and
+              activeHeartOwner()==owner and bottleActionReady(state.bottleFastmem,owner) then
+            local changes={}
+            local ok,err=pcall(function()
+              planStored(changes,inventory.enum,definition[3],4,refill.before)
+              commitChanges(changes)
+            end)
+            pending[id]=nil
+            remembered[id]=ok and refill.before or (BOTTLE_CONTENTS[value] and value or nil)
+            if not ok then log('BOTTLE REFILL: '..tostring(err)) end
           end
-        else
-          refill.readySince=nil
         end
-      elseif BOTTLE_CONTENTS[value] then
-        remembered[id]=value
-        pending[id]=nil
-      elseif value~=EMPTY_BOTTLE then
-        remembered[id]=nil
+      else
+        remembered[id]=BOTTLE_CONTENTS[value] and value or nil
         pending[id]=nil
       end
     else
@@ -761,17 +918,13 @@ local function setRefill(kind,enabled)
       end
     elseif not refillTarget(kind) then error('This value could not be detected.') end
     if state.refills[kind] then return end
-    if kind=='bottles' then
-      state.bottleFastmem=resolveFastmemBase(state.inventory,bottleActionReady)
-      if not state.bottleFastmem then error('The player bottle action state could not be verified.') end
-    end
   end
   state.refills[kind]=enabled or nil
   if kind=='bottles' then
-    state.bottleContents=enabled and {} or nil
-    state.bottlePending=enabled and {} or nil
+    state.bottleOwner=nil
+    state.bottleFastmem=nil
+    forgetBottleActions()
     if enabled then refillBottles() end
-    if not enabled then state.bottleFastmem=nil end
   elseif kind=='consumables' and enabled then refillConsumables() end
   if not next(state.refills) then
     if state.timer then state.timer.destroy(); state.timer=nil end
@@ -831,7 +984,7 @@ D5 B8 2E 17
 local JUMP_EMPTY={}
 for i=1,#JUMP_HOOK do JUMP_EMPTY[i]=0 end
 
-local function nativeGameModule(fastmem)
+nativeGameModule=function(fastmem)
   local owner=activeHeartOwner()
   local vtable=owner and readQword(fastmem+owner)
   local main=vtable and vtable-0x4B25E18
@@ -1183,15 +1336,15 @@ local function replaceMaskSlot(inventory,slot,list)
     if stock then
       local current=u32(stock)
       if current~=0 and current~=1 then error('The mask stock could not be verified.') end
-      planWrite(changes,stock,4,id==selected and 1 or 0)
+      planStored(changes,inventory.int,item[1],4,id==selected and 1 or 0)
     elseif id==selected or id~=1169 then
       error('A mask required by this slot could not be verified.')
     end
     if item[4]==oldActor then replacesWornMask=true end
   end
   if replacesWornMask then
-    planWrite(changes,equipped,64,selectedItem and selectedItem[4] or '')
-    if not selectedItem then planWrite(changes,wearing,1,0) end
+    planStored(changes,inventory.string,0x59D9C7B3,64,selectedItem and selectedItem[4] or '')
+    if not selectedItem then planStored(changes,inventory.bool,0xC27C80FB,1,0) end
   end
   commitChanges(changes)
 end
